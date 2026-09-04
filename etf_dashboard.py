@@ -140,6 +140,41 @@ def extract_close(data: pd.DataFrame, tickers: Iterable[str]) -> pd.DataFrame:
     return close.reindex(columns=tickers)
 
 
+def extract_field(data: pd.DataFrame, field: str, tickers: Iterable[str]) -> pd.DataFrame:
+    """Extract an actions field such as Stock Splits from a yfinance response."""
+    if data.empty:
+        return pd.DataFrame()
+    tickers = list(tickers)
+    if isinstance(data.columns, pd.MultiIndex):
+        level_zero = set(data.columns.get_level_values(0))
+        level_one = set(data.columns.get_level_values(1))
+        if field in level_zero:
+            values = data[field]
+        elif field in level_one:
+            values = data.xs(field, axis=1, level=1)
+        else:
+            return pd.DataFrame(index=data.index, columns=tickers, dtype=float)
+    elif field in data.columns:
+        values = data[[field]].rename(columns={field: tickers[0]})
+    else:
+        return pd.DataFrame(index=data.index, columns=tickers, dtype=float)
+    values.columns = [str(column).upper() for column in values.columns]
+    return values.reindex(columns=tickers)
+
+
+def adjust_for_splits(close: pd.DataFrame, splits: pd.DataFrame) -> pd.DataFrame:
+    """Remove artificial price jumps from splits without applying dividends."""
+    if close.empty or splits.empty:
+        return close
+    split_factors = pd.DataFrame(index=close.index, columns=close.columns, dtype=float)
+    for ticker in close.columns:
+        ratios = pd.to_numeric(splits.get(ticker), errors="coerce").reindex(close.index).fillna(0.0)
+        ratios = ratios.where(ratios > 0, 1.0).rdiv(1.0)
+        # A split on a date affects that day's close; adjust only dates before it.
+        split_factors[ticker] = ratios.iloc[::-1].cumprod().iloc[::-1].shift(-1).fillna(1.0)
+    return close * split_factors
+
+
 @st.cache_data(ttl=900, show_spinner=False)
 def download_prices(tickers: tuple[str, ...], start: date, end: date, adjusted: bool) -> pd.DataFrame:
     if yf is None:
@@ -149,12 +184,17 @@ def download_prices(tickers: tuple[str, ...], start: date, end: date, adjusted: 
         "start": start - timedelta(days=5),
         "end": end + timedelta(days=1),
         "auto_adjust": adjusted,
-        "actions": False,
+        "actions": True,
         "progress": False,
         "group_by": "column",
     }
     raw = yf.download(requested, threads=True, **download_kwargs)
     close = extract_close(raw, requested)
+    splits = extract_field(raw, "Stock Splits", requested)
+    close.index = pd.to_datetime(close.index).tz_localize(None)
+    if not adjusted:
+        splits.index = pd.to_datetime(splits.index).tz_localize(None)
+        close = adjust_for_splits(close, splits)
 
     # Yahoo can return a partial multi-ticker response during throttling. Retry
     # only the missing symbols serially instead of discarding valid history.
@@ -164,12 +204,16 @@ def download_prices(tickers: tuple[str, ...], start: date, end: date, adjusted: 
             retry_raw = yf.download([ticker], threads=False, **download_kwargs)
             retry_close = extract_close(retry_raw, [ticker])
             if ticker in retry_close and retry_close[ticker].notna().any():
+                retry_splits = extract_field(retry_raw, "Stock Splits", [ticker])
+                retry_close.index = pd.to_datetime(retry_close.index).tz_localize(None)
+                if not adjusted:
+                    retry_splits.index = pd.to_datetime(retry_splits.index).tz_localize(None)
+                    retry_close = adjust_for_splits(retry_close, retry_splits)
                 close[ticker] = retry_close[ticker]
         except Exception:
             continue
 
     close = close.reindex(columns=requested)
-    close.index = pd.to_datetime(close.index).tz_localize(None)
     close = close.loc[close.index >= pd.Timestamp(start)]
     return close.apply(pd.to_numeric, errors="coerce").sort_index()
 
@@ -497,7 +541,7 @@ def main() -> None:
         )
         starting_nav = st.number_input("Starting NAV", min_value=1.0, value=DEFAULT_NAV, step=10.0)
         risk_free = st.number_input("Annual risk-free rate", min_value=0.0, max_value=0.25, value=DEFAULT_RISK_FREE, step=0.005, format="%.3f")
-        adjusted = st.checkbox("Include dividends and splits", value=True, help="Adjusted prices make this a total-return-style comparison rather than a price-only index.")
+        adjusted = st.checkbox("Include dividends (splits always adjusted)", value=True, help="Checked includes dividends and splits. Unchecked excludes dividends but still adjusts for stock splits so they do not create artificial returns.")
         show_constituents = st.slider("Constituents to show", min_value=5, max_value=min(50, len(portfolio)), value=min(10, len(portfolio)))
         st.markdown("### CompanyCharts research lens")
         uploaded_scores = st.file_uploader(
@@ -637,7 +681,7 @@ def main() -> None:
 
     with st.expander("Basket and methodology"):
         st.write(f"The model portfolio contains {len(portfolio)} constituents. The underlying weights are maintained in the portfolio configuration and are intentionally not reproduced in the public research view.")
-        st.markdown("**NAV calculation:** each constituent is rebased to 1.00 on its first available quote, multiplied by its configured portfolio weight, and summed. Yahoo Finance adjusted prices are used by default, so the result is a total-return-style proxy. It excludes fees, taxes, bid/ask spreads, slippage, rebalancing, and corporate-action execution effects.")
+        st.markdown("**NAV calculation:** each constituent is rebased to 1.00 on its first available quote, multiplied by its configured portfolio weight, and summed. Splits are always neutralized; Yahoo Finance adjusted prices include dividends by default. The result excludes fees, taxes, bid/ask spreads, slippage, rebalancing, and other corporate-action execution effects.")
 
     with st.expander("CompanyCharts ConsistencyScore and %Max methodology"):
         st.markdown(
