@@ -175,6 +175,30 @@ def adjust_for_splits(close: pd.DataFrame, splits: pd.DataFrame) -> pd.DataFrame
     return close * split_factors
 
 
+def repair_obvious_split_jumps(close: pd.DataFrame, splits: pd.DataFrame) -> pd.DataFrame:
+    """Fallback for a newly announced split missing from the provider actions feed."""
+    if close.empty:
+        return close
+
+    # Compare close-to-close ratios only with common forward and reverse split ratios.
+    # The wide tolerance allows for the normal market move on the split date.
+    price_ratios = (0.1, 0.2, 0.25, 1 / 3, 0.5, 2.0, 3.0, 4.0, 5.0, 10.0)
+    repaired = close.copy()
+    for ticker in repaired.columns:
+        action_series = pd.to_numeric(splits.get(ticker), errors="coerce") if not splits.empty else pd.Series(dtype=float)
+        if action_series.gt(0).any():
+            continue
+        series = repaired[ticker].dropna()
+        if len(series) < 5:
+            continue
+        observed = series.div(series.shift(1)).dropna()
+        for split_date, ratio in observed.items():
+            if any(abs(ratio / candidate - 1.0) <= 0.08 for candidate in price_ratios):
+                repaired.loc[repaired.index < split_date, ticker] *= ratio
+                break
+    return repaired
+
+
 @st.cache_data(ttl=900, show_spinner=False)
 def download_prices(tickers: tuple[str, ...], start: date, end: date, adjusted: bool) -> pd.DataFrame:
     if yf is None:
@@ -195,6 +219,7 @@ def download_prices(tickers: tuple[str, ...], start: date, end: date, adjusted: 
     if not adjusted:
         splits.index = pd.to_datetime(splits.index).tz_localize(None)
         close = adjust_for_splits(close, splits)
+        close = repair_obvious_split_jumps(close, splits)
 
     # Yahoo can return a partial multi-ticker response during throttling. Retry
     # only the missing symbols serially instead of discarding valid history.
@@ -209,6 +234,7 @@ def download_prices(tickers: tuple[str, ...], start: date, end: date, adjusted: 
                 if not adjusted:
                     retry_splits.index = pd.to_datetime(retry_splits.index).tz_localize(None)
                     retry_close = adjust_for_splits(retry_close, retry_splits)
+                    retry_close = repair_obvious_split_jumps(retry_close, retry_splits)
                 close[ticker] = retry_close[ticker]
         except Exception:
             continue
