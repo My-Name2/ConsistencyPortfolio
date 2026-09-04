@@ -185,9 +185,6 @@ def repair_obvious_split_jumps(close: pd.DataFrame, splits: pd.DataFrame) -> pd.
     price_ratios = (0.1, 0.2, 0.25, 1 / 3, 0.5, 2.0, 3.0, 4.0, 5.0, 10.0)
     repaired = close.copy()
     for ticker in repaired.columns:
-        action_series = pd.to_numeric(splits.get(ticker), errors="coerce") if not splits.empty else pd.Series(dtype=float)
-        if action_series.gt(0).any():
-            continue
         series = repaired[ticker].dropna()
         if len(series) < 5:
             continue
@@ -219,7 +216,9 @@ def download_prices(tickers: tuple[str, ...], start: date, end: date, adjusted: 
     if not adjusted:
         splits.index = pd.to_datetime(splits.index).tz_localize(None)
         close = adjust_for_splits(close, splits)
-        close = repair_obvious_split_jumps(close, splits)
+    # Also inspect adjusted prices: Yahoo can expose a fresh split action before
+    # its auto-adjusted Close series has incorporated the event.
+    close = repair_obvious_split_jumps(close, splits)
 
     # Yahoo can return a partial multi-ticker response during throttling. Retry
     # only the missing symbols serially instead of discarding valid history.
@@ -234,7 +233,7 @@ def download_prices(tickers: tuple[str, ...], start: date, end: date, adjusted: 
                 if not adjusted:
                     retry_splits.index = pd.to_datetime(retry_splits.index).tz_localize(None)
                     retry_close = adjust_for_splits(retry_close, retry_splits)
-                    retry_close = repair_obvious_split_jumps(retry_close, retry_splits)
+                retry_close = repair_obvious_split_jumps(retry_close, retry_splits)
                 close[ticker] = retry_close[ticker]
         except Exception:
             continue
