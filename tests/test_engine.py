@@ -223,3 +223,21 @@ def test_placeholder_cover_shares_fall_back_to_weighted_basic():
     snap = r.snapshot_inputs
     assert snap["shares_out"] == pytest.approx(2 * fixture.PRE_SPLIT_SHARES)
     assert "weighted basic" in snap["shares_source"]
+
+
+def test_lessor_revenue_adds_lease_income_only_when_it_exceeds_contract_revenue():
+    from valuation.dq import DQLog
+    from valuation.tags import METRICS
+    from valuation.values import MetricTable, lessor_revenue
+
+    start, end = pd.Timestamp("2025-01-01"), pd.Timestamp("2025-12-31")
+
+    def table(tag, value):
+        return pd.DataFrame([{"start": start, "end": end, "days": 365, "value": value, "first_value": value, "tag": tag, "accn": "x"}])
+
+    contract = "RevenueFromContractWithCustomerExcludingAssessedTax"
+    lease = MetricTable(METRICS["lease_income"], table("OperatingLeaseLeaseIncome", 1_500.0))
+    small = lessor_revenue(MetricTable(METRICS["revenue"], table(contract, 13.0)), lease, DQLog())
+    assert small.value(start, end) == pytest.approx(1_513.0)  # REIT-style: contract revenue is a small component
+    total = lessor_revenue(MetricTable(METRICS["revenue"], table(contract, 2_800.0)), lease, DQLog())
+    assert total.value(start, end) == pytest.approx(2_800.0)  # contract tag already holds total revenue

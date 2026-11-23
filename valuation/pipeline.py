@@ -256,7 +256,23 @@ class BalanceSheet:
         if near.empty:
             return None
         latest_end = near["end"].max()
-        return near[near["end"] == latest_end].sort_values("days").iloc[0].to_dict()
+        row = near[near["end"] == latest_end].sort_values("days").iloc[0].to_dict()
+        earlier = basic[(basic["end"] < latest_end - pd.Timedelta(days=30)) & (basic["end"] >= latest_end - pd.Timedelta(days=400))]
+        if not earlier.empty:
+            prior = float(earlier["value"].median())  # median of the prior year resists a single mis-scaled period
+            if prior > 0 and not (1 / 3 <= float(row["value"]) / prior <= 3):
+                if "implausible_basic" not in self._logged_partial:
+                    self._logged_partial.add("implausible_basic")
+                    self.dq.add(
+                        "fallback_tag",
+                        "Weighted basic shares",
+                        f"Weighted basic shares {float(row['value']):,.0f} for the period ending {latest_end.date()} are more than 3x away from the prior year's "
+                        f"median {prior:,.0f} (likely a scaling error in the filing); not used to check or replace cover-page shares.",
+                        period=latest_end,
+                        severity="warning",
+                    )
+                return None
+        return row
 
     def _fallback_shares(self, instant, skip_balance_sheet: bool = False) -> dict:
         row = None if skip_balance_sheet else self.tables["bs_shares"].get(None, instant)

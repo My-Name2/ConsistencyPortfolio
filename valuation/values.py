@@ -307,7 +307,9 @@ def lessor_revenue(revenue: MetricTable, lease: MetricTable, dq: DQLog) -> Metri
     added = 0
     for i in t.index[t["tag"].astype(str).str.startswith("RevenueFromContractWithCustomer")]:
         row = lease.get(t.at[i, "start"], t.at[i, "end"], tol=0)
-        if row is not None and row["value"]:
+        # Only when lease income exceeds contract revenue can contract revenue not already be the total
+        # (many lessors tag total revenue, lease income included, under the contract-revenue tag).
+        if row is not None and row["value"] and float(row["value"]) > float(t.at[i, "value"]):
             t.at[i, "value"] = float(t.at[i, "value"]) + float(row["value"])
             t.at[i, "first_value"] = float(t.at[i, "first_value"]) + float(row["value"])
             t.at[i, "tag"] = f"derived: {t.at[i, 'tag']} + {row['tag']}"
@@ -316,7 +318,7 @@ def lessor_revenue(revenue: MetricTable, lease: MetricTable, dq: DQLog) -> Metri
         dq.add(
             "derived_value",
             revenue.metric.label,
-            f"{added} period(s): total revenue not tagged; revenue = contract revenue + operating lease income for the same period (lessor presentation).",
+            f"{added} period(s): total revenue not tagged and lease income exceeds contract revenue; revenue = contract revenue + operating lease income for the same period (lessor presentation).",
             severity="warning",
         )
     return MetricTable(revenue.metric, t)
