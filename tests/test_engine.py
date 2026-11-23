@@ -302,3 +302,46 @@ def test_furniture_and_fixtures_line_alone_is_capex():
 
     r = _review_with(mutate)
     assert row_for(r, "2024-06-30")["ttm_capex"] == pytest.approx(4 * fixture.CAPEX)
+
+def _calendar_from(periods):
+    from valuation.dq import DQLog
+    from valuation.periods import build_calendar
+    from valuation.tags import METRICS
+    from valuation.values import MetricTable
+
+    rows = []
+    for s, e in periods:
+        s, e = pd.Timestamp(s), pd.Timestamp(e)
+        rows.append({"start": s, "end": e, "days": (e - s).days + 1, "value": 1.0, "first_value": 1.0, "tag": "Revenues", "accn": "x"})
+    return build_calendar([MetricTable(METRICS["revenue"], pd.DataFrame(rows))], DQLog(), pd.Timestamp("2026-01-01"))
+
+
+def test_switch_to_52_53_week_years_keeps_the_following_year():
+    # FY2016 first reported on month ends, later restated to end a day earlier; FY2017 starts 2016-10-31
+    # (Deere 2016-2017). The one-day overlap must not drop FY2017 and its quarters.
+    cal = _calendar_from([
+        ("2015-11-01", "2016-01-31"), ("2015-11-01", "2016-04-30"), ("2015-11-01", "2016-07-31"), ("2015-11-01", "2016-10-31"),
+        ("2015-11-02", "2016-10-30"),
+        ("2016-10-31", "2017-01-29"), ("2016-10-31", "2017-04-30"), ("2016-10-31", "2017-07-30"), ("2016-10-31", "2017-10-29"),
+        ("2017-10-30", "2018-01-28"),
+    ])
+    ends = [q.end for q in cal.quarters]
+    assert pd.Timestamp("2017-01-29") in ends and pd.Timestamp("2017-10-29") in ends
+    q1_2018 = next(q for q in cal.quarters if q.end == pd.Timestamp("2018-01-28"))
+    chain = cal.previous_quarters(q1_2018, 4)
+    assert chain is not None and chain[0].end == pd.Timestamp("2017-04-30")
+
+
+def test_four_quarter_chain_runs_through_a_transition_period():
+    # Fiscal year end moved from June to December: a six-month transition period Jul-Dec 2012 (ADM).
+    cal = _calendar_from([
+        ("2011-07-01", "2011-09-30"), ("2011-07-01", "2011-12-31"), ("2011-07-01", "2012-03-31"), ("2011-07-01", "2012-06-30"),
+        ("2012-07-01", "2012-09-30"), ("2012-07-01", "2012-12-31"), ("2012-10-01", "2012-12-31"),
+        ("2013-01-01", "2013-03-31"), ("2013-01-01", "2013-06-30"), ("2013-01-01", "2013-09-30"), ("2013-01-01", "2013-12-31"),
+    ])
+    ends = [q.end for q in cal.quarters]
+    assert ends.count(pd.Timestamp("2013-03-31")) == 1  # the transition period does not borrow FY2013's Q1
+    q2_2013 = next(q for q in cal.quarters if q.end == pd.Timestamp("2013-06-30"))
+    chain = cal.previous_quarters(q2_2013, 4)
+    assert chain is not None
+    assert [q.end.date().isoformat() for q in chain] == ["2012-09-30", "2012-12-31", "2013-03-31", "2013-06-30"]

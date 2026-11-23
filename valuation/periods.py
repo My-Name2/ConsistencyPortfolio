@@ -89,18 +89,31 @@ class Calendar:
     def previous_quarters(self, q: Quarter, n: int) -> list[Quarter] | None:
         """The n consecutive quarters ending at q (inclusive), or None if any is missing."""
         out = [q]
-        fy, k = q.fy, q.k
         while len(out) < n:
-            k -= 1
-            if k == 0:
-                if not self.years[fy].consecutive_with_prior:
-                    return None
-                fy, k = fy - 1, 4
-            prior = self.quarter(fy, k)
+            prior = self._preceding(out[0])
             if prior is None:
                 return None
             out.insert(0, prior)
         return out
+
+    def _preceding(self, q: Quarter) -> Quarter | None:
+        """The quarter that ends the day before q starts.
+
+        Within a fiscal year that is Q(k-1); across consecutive years it is the prior year's Q4. When the
+        prior year is provisional (a transition period after a fiscal-year change, or a year without an
+        annual value) the chain continues through any calendar quarter ending the day before q starts.
+        """
+        if q.k > 1:
+            return self.quarter(q.fy, q.k - 1)
+        if self.years[q.fy].consecutive_with_prior:
+            prior = self.quarter(q.fy - 1, 4)
+            if prior is not None:
+                return prior
+        if q.start is None:
+            return None
+        target = q.start - pd.Timedelta(days=1)
+        hits = [p for p in self.quarters if p.end < q.end and abs(p.end - target) <= TOL]
+        return hits[-1] if hits else None
 
 
 def _cluster_dates(dates: list[pd.Timestamp]) -> list[pd.Timestamp]:
@@ -162,11 +175,21 @@ def build_calendar(tables: list[MetricTable], dq: DQLog, as_of: pd.Timestamp) ->
                 last = ends[k]
         years.append(FiscalYear(len(years), start, end, valid))
 
-    # Drop provisional years that overlap a real fiscal year (e.g. E+1 of a changed fiscal year).
+    # Drop provisional years that overlap a real fiscal year (e.g. E+1 of a changed fiscal year). A boundary
+    # that differs by no more than the date tolerance is the same boundary, not an overlap: a company moving
+    # from month-end to 52/53-week years restates the prior year to end a day or two later (e.g. 2016-10-30
+    # instead of 2016-10-31) while the next year starts on 2016-10-31.
     cleaned: list[FiscalYear] = []
     for fy in years:
-        if cleaned and cleaned[-1].end is not None and fy.start <= cleaned[-1].end:
+        if cleaned and cleaned[-1].end is not None and fy.start + TOL <= cleaned[-1].end:
             continue
+        if cleaned and cleaned[-1].end is None:
+            # A provisional year (a transition period, or a year without an annual value) ends where the next
+            # year starts; quarter ends it borrowed from beyond that boundary belong to the next year.
+            prev = cleaned[-1]
+            prev.quarter_ends = {k: v for k, v in prev.quarter_ends.items() if v <= fy.start - pd.Timedelta(days=1) + TOL}
+            if not prev.quarter_ends:
+                cleaned.pop()
         cleaned.append(fy)
     years = cleaned
     for i, fy in enumerate(years):
@@ -412,6 +435,9 @@ def ttm_shares(shares: MetricTable, qv: pd.DataFrame, cal: Calendar, q: Quarter)
         if all(v is not None for v in vals):
             return TTMValue(float(np.mean(vals)), "avg4Q", vals, [f"Q{i.k} {i.end.date()}" for i in four], None, "", "", "four reported quarterly counts")
     fy_index = q.fy if q.k == 4 else q.fy - 1
+    # After a transition period (a provisional year without an annual end) the latest fiscal year is the one before it.
+    while q.k != 4 and fy_index >= 0 and cal.years[fy_index].end is None:
+        fy_index -= 1
     if fy_index < 0:
         return TTMValue(None, "", [], [], None, "", "no fiscal-year diluted share count", "")
     fy = cal.years[fy_index]
