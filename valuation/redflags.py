@@ -13,6 +13,8 @@ from dataclasses import dataclass
 
 import pandas as pd
 
+from .prices import exchange_holidays
+
 ACCN_RE = re.compile(r"\b\d{10}-\d{2}-\d{6}\b")
 
 DEADLINE_DAYS = {"10-K": 90, "10-Q": 45, "20-F": 120, "10-KT": 90, "10-QT": 45}
@@ -129,20 +131,29 @@ def data_flags(review) -> list[dict]:
 
     # Late periodic filings (beyond the longest standard deadline for the form).
     filings = review.filings
-    for row in filings.itertuples():
+    seen: set[tuple[str, pd.Timestamp]] = set()
+    for row in filings.sort_values(["filed", "accn"]).itertuples():
         base_form = row.form.replace("/A", "")
         if row.form.endswith("/A") or base_form not in DEADLINE_DAYS or pd.isna(row.report_period):
             continue
+        key = (base_form, row.report_period)
+        if key in seen:
+            continue  # a later filing for an already-reported period is a re-filing, not a late original
+        seen.add(key)
         limit = DEADLINE_DAYS[base_form]
         if base_form == "20-F" and row.report_period < pd.Timestamp("2011-12-15"):
             limit = 183
         days = (row.filed - row.report_period).days
-        if days > limit:
+        deadline = row.report_period + pd.Timedelta(days=limit)
+        while deadline.weekday() >= 5 or deadline.date() in exchange_holidays(deadline.year):
+            deadline += pd.Timedelta(days=1)  # a deadline on a weekend or holiday moves to the next business day
+        if row.filed > deadline:
             flags.append(
                 {
-                    "flag": "late filing",
-                    "severity": "serious",
-                    "evidence": f"{row.form} for the period ending {row.report_period.date()} filed {row.filed.date()} ({days} days; longest standard deadline {limit}).",
+                    "flag": "possible late filing",
+                    "severity": "warning",
+                    "evidence": f"{row.form} for the period ending {row.report_period.date()} filed {row.filed.date()} ({days} days; longest standard deadline {limit} days, due {deadline.date()}). "
+                    "It is the first filing in Input A for this period, but it may be a re-filing of an earlier report without XBRL; verify on EDGAR (NT 10-K/10-Q notices are not in Input A).",
                     "source": f"{row.form} {row.accn}",
                 }
             )
