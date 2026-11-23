@@ -292,3 +292,13 @@ def test_construction_line_smaller_than_total_is_not_added():
 
     r = _review_with(mutate)
     assert row_for(r, "2024-06-30")["ttm_capex"] == pytest.approx(4 * fixture.CAPEX)
+
+
+def test_furniture_and_fixtures_line_alone_is_capex():
+    # Asset managers (e.g. KKR) tag their only PP&E purchase line as furniture and fixtures.
+    def mutate(f):
+        _move_capex(f, "PaymentsToAcquireFurnitureAndFixtures", 1.0)
+        del f["us-gaap"]["PaymentsToAcquirePropertyPlantAndEquipment"]
+
+    r = _review_with(mutate)
+    assert row_for(r, "2024-06-30")["ttm_capex"] == pytest.approx(4 * fixture.CAPEX)

@@ -119,6 +119,7 @@ METRICS: dict[str, MetricDef] = {
                 "PaymentsToAcquireOtherPropertyPlantAndEquipment",
                 "PaymentsForConstructionInProcess",
                 "PaymentsForProceedsFromProductiveAssets",
+                "PaymentsToAcquireFurnitureAndFixtures",
             ),
             ifrs=("PurchaseOfPropertyPlantAndEquipmentClassifiedAsInvestingActivities", "PurchaseOfPropertyPlantAndEquipment"),
             notes={
@@ -129,6 +130,7 @@ METRICS: dict[str, MetricDef] = {
                 "PaymentsToExploreAndDevelopOilAndGasProperties": "exploration and development additions; other PP&E lines of the same period are added",
                 "PaymentsForConstructionInProcess": "construction expenditures (utility/REIT presentation)",
                 "PaymentsForProceedsFromProductiveAssets": "net of disposal proceeds (the only capex line tagged)",
+                "PaymentsToAcquireFurnitureAndFixtures": "furniture and fixtures purchases are the only PP&E purchase line tagged",
             },
         ),
         _m(
