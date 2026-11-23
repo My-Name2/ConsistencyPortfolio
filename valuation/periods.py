@@ -285,9 +285,35 @@ def quarterly_values(metric: MetricTable, cal: Calendar, dq: DQLog) -> pd.DataFr
                 "accn": None if reported is None else reported["accn"],
             }
         )
+    if metric.metric.key in ("revenue", "gross_profit"):
+        _exclude_misdated_quarters(rows, metric.metric.label, dq)
     frame = pd.DataFrame(rows)
     frame.attrs["index"] = {(r["fy"], r["k"]): r for r in rows}
     return frame
+
+
+MISDATED_RATIO = 2.5
+
+
+def _exclude_misdated_quarters(rows: list[dict], label: str, dq: DQLog) -> None:
+    """Drop a quarter far larger than both neighbours (e.g. a full-year value tagged with quarter dates)."""
+    values = [r["value"] for r in rows]
+    for i in range(1, len(rows) - 1):
+        v, prev, nxt = values[i], values[i - 1], values[i + 1]
+        if not all(isinstance(x, float) and x > 0 for x in (v, prev, nxt)):
+            continue
+        if v > MISDATED_RATIO * max(prev, nxt):
+            dq.add(
+                "quarter_mismatch",
+                label,
+                f"Q{rows[i]['k']} ending {rows[i]['q_end'].date()}: {v:,.6g} is more than {MISDATED_RATIO}x both neighbouring quarters "
+                f"({prev:,.6g}, {nxt:,.6g}); treated as a mis-dated fact (often a full-year value tagged with quarter dates) and excluded.",
+                period=rows[i]["q_end"],
+                filing=rows[i]["accn"] or rows[i]["ytd_accn"] or "",
+                severity="warning",
+            )
+            rows[i]["value"], rows[i]["source"] = None, "excluded"
+    return None
 
 
 def _qv_row(qv: pd.DataFrame, fy: int, k: int) -> dict | None:

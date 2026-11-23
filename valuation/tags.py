@@ -44,8 +44,14 @@ METRICS: dict[str, MetricDef] = {
                 "SalesRevenueServicesNet",
                 "RevenuesNetOfInterestExpense",
                 "RegulatedAndUnregulatedOperatingRevenue",
+                "OperatingLeaseLeaseIncome",
             ),
             ifrs=("Revenue", "RevenueFromContractsWithCustomers", "RevenueFromSaleOfGoods"),
+            notes={"OperatingLeaseLeaseIncome": "lease income only (lessor with no total revenue tag)"},
+        ),
+        _m(
+            "lease_income", "Operating lease income", "duration", "money", True,
+            us=("OperatingLeaseLeaseIncome", "OperatingLeasesIncomeStatementLeaseRevenue"),
         ),
         _m(
             "cost_of_revenue", "Cost of revenue", "duration", "money", True,
@@ -107,9 +113,13 @@ METRICS: dict[str, MetricDef] = {
                 "PaymentsToAcquirePropertyPlantAndEquipment",
                 "PaymentsToAcquireProductiveAssets",
                 "PaymentsForCapitalImprovements",
+                "PaymentsToAcquireOtherProductiveAssets",
             ),
             ifrs=("PurchaseOfPropertyPlantAndEquipmentClassifiedAsInvestingActivities", "PurchaseOfPropertyPlantAndEquipment"),
-            notes={"PaymentsToAcquireProductiveAssets": "may include intangibles and other productive assets"},
+            notes={
+                "PaymentsToAcquireProductiveAssets": "may include intangibles and other productive assets",
+                "PaymentsToAcquireOtherProductiveAssets": "'other productive assets' line used as capex (no PP&E capex tag for the period)",
+            },
         ),
         _m(
             "da", "Depreciation & amortization (cash flow)", "duration", "money", True,

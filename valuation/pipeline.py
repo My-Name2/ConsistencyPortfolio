@@ -18,7 +18,7 @@ from .redflags import InputBDocument, data_flags, text_flags
 from .splits import SplitBasis, detect_splits
 from .stats import SERIES, stats_table
 from .tags import BALANCE_ANCHOR_METRICS, CALENDAR_METRICS, COVER_SHARES_TAG, DEBT_TAGS, DEI, IFRS, METRICS, US, MetricDef
-from .values import MetricTable, build_metric_table, derive_gross_profit, parent_equity, parent_share_of_profit_loss
+from .values import MetricTable, build_metric_table, derive_gross_profit, lessor_revenue, parent_equity, parent_share_of_profit_loss
 
 FLOW_KEYS = ["revenue", "gross_profit", "operating_income", "net_income", "ocf", "capex", "da", "dividends_paid", "impairment", "disc_ops", "disposal_gains"]
 TTM_COLUMNS = {
@@ -36,6 +36,7 @@ DISPLAY_YEARS = 15
 EPS_CHECK_TOL = 0.05
 THIN_MIN_YEARS = 3
 THIN_MIN_TTM = 8
+COVER_CLASS_RATIO = 0.85  # cover-page shares below this share of weighted basic shares cover one class only
 
 
 @dataclass
@@ -111,6 +112,7 @@ class BalanceSheet:
         cover = f[(f["taxonomy"] == DEI) & (f["tag"] == COVER_SHARES_TAG) & (f["unit"] == "shares")]
         self.cover = cover.sort_values(["filed", "accn"])
         self._logged_multi: set[str] = set()
+        self._logged_partial: set[str] = set()
         self._logged_fallback = False
 
     def at(self, when: pd.Timestamp) -> dict:
@@ -190,6 +192,18 @@ class BalanceSheet:
 
     def _cover_shares(self, when, instant) -> dict:
         cand = self.cover[self.cover["filed"] <= when]
+        if not cand.empty and cand["end"].max() < instant - pd.Timedelta(days=400):
+            if "stale" not in self._logged_partial:
+                self._logged_partial.add("stale")
+                self.dq.add(
+                    "fallback_tag",
+                    "Shares outstanding",
+                    f"The latest cover-page share count ({cand['end'].max().date()}) is more than a year older than the balance sheet "
+                    f"({instant.date()}); it is not used and market cap falls back to other share counts.",
+                    period=instant,
+                    severity="warning",
+                )
+            cand = cand.iloc[0:0]
         if not cand.empty:
             accn = cand.iloc[-1]["accn"]
             rows = cand[cand["accn"] == accn]
@@ -200,6 +214,20 @@ class BalanceSheet:
                 self._logged_multi.add(accn)
                 self.dq.add("assumption", "cover-page shares", f"{len(rows)} distinct cover-page share counts in one filing (likely share classes); summed to {reported:,.0f}.", period=rows.iloc[0]["end"], filing=accn, severity="warning")
             factor = self.basis.share_factor(filed)
+            weighted = self._weighted_basic(instant)
+            if weighted and reported * factor < COVER_CLASS_RATIO * weighted:
+                if accn not in self._logged_partial:
+                    self._logged_partial.add(accn)
+                    self.dq.add(
+                        "fallback_tag",
+                        "Shares outstanding",
+                        f"Cover-page shares {reported * factor:,.0f} are {reported * factor / weighted:.0%} of weighted basic shares {weighted:,.0f} for the period; "
+                        "they appear to cover one share class only (or are a placeholder), so market cap uses the weighted basic count.",
+                        period=rows.iloc[0]["end"],
+                        filing=accn,
+                        severity="warning",
+                    )
+                return self._fallback_shares(instant, skip_balance_sheet=True)
             return {
                 "cover_shares_reported": reported,
                 "cover_date": rows.iloc[0]["end"],
@@ -210,22 +238,35 @@ class BalanceSheet:
                 "shares_out": reported * factor,
                 "shares_source": "dei:EntityCommonStockSharesOutstanding",
             }
-        row = self.tables["bs_shares"].get(None, instant)
+        return self._fallback_shares(instant)
+
+    def _weighted_basic(self, instant) -> float | None:
+        basic = self.tables["basic_shares"].table
+        if basic.empty:
+            return None
+        row = self._latest_basic(instant)
+        return None if row is None else float(row["value"])
+
+    def _latest_basic(self, instant) -> dict | None:
+        """Weighted basic shares for the period ending at the instant, else the latest within 200 days before it."""
+        basic = self.tables["basic_shares"].table
+        if basic.empty:
+            return None
+        near = basic[(basic["end"] <= instant + pd.Timedelta(days=3)) & (basic["end"] >= instant - pd.Timedelta(days=200))]
+        if near.empty:
+            return None
+        latest_end = near["end"].max()
+        return near[near["end"] == latest_end].sort_values("days").iloc[0].to_dict()
+
+    def _fallback_shares(self, instant, skip_balance_sheet: bool = False) -> dict:
+        row = None if skip_balance_sheet else self.tables["bs_shares"].get(None, instant)
         source = None
         if row is not None:
             source = f"{row['tag']} (balance sheet, fallback)"
         else:
-            basic = self.tables["basic_shares"].table
-            if not basic.empty:
-                at_instant = basic[(basic["end"] <= instant) & (basic["end"] > instant - pd.Timedelta(days=3))]
-                quarter = at_instant[at_instant["days"].between(80, 125)]
-                annual = at_instant[at_instant["days"].between(350, 380)]
-                if not quarter.empty:
-                    row = quarter.iloc[-1].to_dict()
-                    source = f"{row['tag']} 3-month weighted basic (fallback)"
-                elif not annual.empty:
-                    row = annual.iloc[-1].to_dict()
-                    source = f"{row['tag']} fiscal-year weighted basic (fallback)"
+            row = self._latest_basic(instant)
+            if row is not None:
+                source = f"{row['tag']} weighted basic, {int(row['days'])}-day period ending {row['end'].date()} (fallback)"
         if row is not None:
             if not self._logged_fallback:
                 self._logged_fallback = True
@@ -295,6 +336,7 @@ def run_review(inp: ReviewInputs) -> Review:
             dq.add("price_basis", "dividend basis not stated", "Input C does not state whether closes are dividend-adjusted; treated as traded closes.", severity="warning")
 
     tables = {key: build_metric_table(cf, METRICS[key], basis, dq) for key in METRICS}
+    tables["revenue"] = lessor_revenue(tables["revenue"], tables["lease_income"], dq)
     tables["gross_profit"] = derive_gross_profit(tables["gross_profit"], tables["revenue"], tables["cost_of_revenue"], dq)
     tables["net_income"] = parent_share_of_profit_loss(tables["net_income"], tables["nci_income"], dq)
     tables["equity"] = parent_equity(tables["equity"], tables["nci"], dq)

@@ -20,6 +20,7 @@ from .splits import SplitBasis
 from .tags import MetricDef
 
 RESTATEMENT_TOL = 0.005
+ANNUAL_FORMS = {"10-K", "10-K/A", "10-K405", "10-KT", "10-KT/A", "20-F", "20-F/A", "40-F", "40-F/A"}
 TOL_DAYS = 3
 
 
@@ -54,6 +55,19 @@ def raw_tag_table(cf: CompanyFacts, taxonomy: str, tag: str, kind: str, unit_typ
     subset = subset.sort_values(["filed", "accn"]).copy()
     subset["norm"] = _normalize(subset["val"], subset["filed"], unit_type, basis)
     keys = ["start", "end"] if kind == "duration" else ["end"]
+    ignored = pd.Series(dtype=float)
+    if kind == "duration":
+        # A full-year period takes its value from annual reports when one reports it; a full-year
+        # value that appears in a 10-Q (often a mis-dated comparative) is ignored and logged.
+        days = (subset["end"] - subset["start"]).dt.days + 1
+        annual = days.between(350, 380)
+        from_annual_form = subset["form"].isin(ANNUAL_FORMS)
+        period = subset["start"].astype(str) + "|" + subset["end"].astype(str)
+        covered = set(period[annual & from_annual_form])
+        drop = annual & ~from_annual_form & period.isin(covered)
+        if drop.any():
+            ignored = subset[drop].groupby(keys)["norm"].last()
+            subset = subset[~drop]
     latest = subset.groupby(keys, dropna=False).tail(1).set_index(keys)
     first = subset.groupby(keys, dropna=False).head(1).set_index(keys)
     n_filings = subset.groupby(keys, dropna=False)["accn"].nunique()
@@ -81,6 +95,12 @@ def raw_tag_table(cf: CompanyFacts, taxonomy: str, tag: str, kind: str, unit_typ
         table["days"] = np.nan
     table["taxonomy"] = taxonomy
     table["tag"] = tag
+    table["ignored_quarterly_report_value"] = np.nan
+    if not ignored.empty and kind == "duration":
+        lookup = {(a, b): v for (a, b), v in ignored.items()}
+        table["ignored_quarterly_report_value"] = [lookup.get((a, b), np.nan) for a, b in zip(table["start"], table["end"])]
+        same = (table["ignored_quarterly_report_value"] - table["value"]).abs() <= table["value"].abs() * RESTATEMENT_TOL
+        table.loc[same, "ignored_quarterly_report_value"] = np.nan
     diff = (table["value"] - table["first_value"]).abs()
     scale = table[["value", "first_value"]].abs().max(axis=1).replace(0, np.nan)
     table["restated"] = (diff / scale > RESTATEMENT_TOL) & (diff > 0)
@@ -164,6 +184,17 @@ def build_metric_table(cf: CompanyFacts, metric: MetricDef, basis: SplitBasis, d
             f"{group['end'].min().date()} to {group['end'].max().date()}." + (f" Note: {note}." if note else ""),
             severity="warning" if note else "info",
         )
+    if "ignored_quarterly_report_value" in chosen:
+        for _, row in chosen[chosen["ignored_quarterly_report_value"].notna()].iterrows():
+            dq.add(
+                "restatement",
+                metric.label,
+                f"{row['tag']} {row['start'].date()}..{row['end'].date()}: a quarterly report shows {row['ignored_quarterly_report_value']:,.4g} for this full year; "
+                f"the annual report's {row['value']:,.4g} ({row['form']} {row['accn']}) is used.",
+                period=row["end"],
+                filing=row["accn"],
+                severity="warning",
+            )
     for _, row in chosen[chosen["restated"]].iterrows():
         period = f"{row['start'].date()}..{row['end'].date()}" if pd.notna(row["start"]) else f"{row['end'].date()}"
         change = (row["value"] - row["first_value"]) / abs(row["first_value"]) if row["first_value"] else np.nan
@@ -265,3 +296,27 @@ def parent_equity(equity: MetricTable, nci: MetricTable, dq: DQLog) -> MetricTab
     if adjusted:
         dq.add("derived_value", equity.metric.label, f"{adjusted} instant(s): parent equity = total equity - noncontrolling interest (both tagged at the same date).", severity="warning")
     return MetricTable(equity.metric, t)
+
+
+def lessor_revenue(revenue: MetricTable, lease: MetricTable, dq: DQLog) -> MetricTable:
+    """Total revenue for lessors that tag contract revenue and lease income separately but no total."""
+    t = revenue.table
+    if t.empty or lease.table.empty:
+        return revenue
+    t = t.copy()
+    added = 0
+    for i in t.index[t["tag"].astype(str).str.startswith("RevenueFromContractWithCustomer")]:
+        row = lease.get(t.at[i, "start"], t.at[i, "end"], tol=0)
+        if row is not None and row["value"]:
+            t.at[i, "value"] = float(t.at[i, "value"]) + float(row["value"])
+            t.at[i, "first_value"] = float(t.at[i, "first_value"]) + float(row["value"])
+            t.at[i, "tag"] = f"derived: {t.at[i, 'tag']} + {row['tag']}"
+            added += 1
+    if added:
+        dq.add(
+            "derived_value",
+            revenue.metric.label,
+            f"{added} period(s): total revenue not tagged; revenue = contract revenue + operating lease income for the same period (lessor presentation).",
+            severity="warning",
+        )
+    return MetricTable(revenue.metric, t)
