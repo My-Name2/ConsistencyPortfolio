@@ -176,3 +176,50 @@ def test_storage_refuses_c_drive():
 
 def test_ticker_list_parsing():
     assert parse_ticker_list("'TTD','CHTR', 'smci'\nAAPL # comment\nTTD") == ["TTD", "CHTR", "SMCI", "AAPL"]
+
+
+# ---------------------------------------------------------------- regressions found by comparing with a reference dataset
+
+def _review_with(mutate):
+    facts = fixture.companyfacts()
+    mutate(facts["facts"])
+    meta = PriceMeta(ticker="SYNT", split_adjusted=False, dividend_adjusted=False, currency="USD")
+    return run_review(ReviewInputs(facts=facts, as_of=fixture.AS_OF, prices=fixture.prices(), price_meta=meta, ticker="SYNT"))
+
+
+def test_full_year_value_in_a_10q_does_not_override_the_10k():
+    def mutate(f):
+        f["us-gaap"]["Revenues"]["units"]["USD"].append(
+            {"start": "2023-01-01", "end": "2023-12-31", "val": 1.0, "accn": "0000000001-24-999999", "fy": 2024, "fp": "Q1", "form": "10-Q", "filed": "2024-05-20"}
+        )
+
+    r = _review_with(mutate)
+    assert row_for(r, "2023-12-31")["ttm_revenue"] == pytest.approx(sum(fixture.revenue(2023, k) for k in (1, 2, 3, 4)))
+    dq = r.dq.frame()
+    assert dq["detail"].str.contains("a quarterly report shows 1 for this full year").any()
+
+
+def test_misdated_quarter_is_excluded():
+    def mutate(f):
+        for item in f["us-gaap"]["Revenues"]["units"]["USD"]:
+            if item.get("start") == "2024-04-01" and item["end"] == "2024-06-30":
+                item["val"] = 4 * 4 * fixture.revenue(2024, 2)  # a full-year-sized number with quarter dates
+
+    r = _review_with(mutate)
+    dq = r.dq.frame()
+    assert dq["detail"].str.contains("mis-dated fact").any()
+    # The TTM uses FY + YTD - prior YTD, so it is unaffected by the bad quarter.
+    assert row_for(r, "2024-06-30")["ttm_revenue"] == pytest.approx(sum(fixture.revenue(*q) for q in [(2023, 3), (2023, 4), (2024, 1), (2024, 2)]))
+
+
+def test_placeholder_cover_shares_fall_back_to_weighted_basic():
+    def mutate(f):
+        diluted = f["us-gaap"]["WeightedAverageNumberOfDilutedSharesOutstanding"]
+        f["us-gaap"]["WeightedAverageNumberOfSharesOutstandingBasic"] = {"label": "basic", "units": {"shares": [dict(i) for i in diluted["units"]["shares"]]}}
+        for item in f["dei"]["EntityCommonStockSharesOutstanding"]["units"]["shares"]:
+            item["val"] = 1.0
+
+    r = _review_with(mutate)
+    snap = r.snapshot_inputs
+    assert snap["shares_out"] == pytest.approx(2 * fixture.PRE_SPLIT_SHARES)
+    assert "weighted basic" in snap["shares_source"]
