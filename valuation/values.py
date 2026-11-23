@@ -17,7 +17,7 @@ import pandas as pd
 from .dq import DQLog
 from .facts import CompanyFacts
 from .splits import SplitBasis
-from .tags import MetricDef
+from .tags import CAPEX_COMPONENT_TAGS, CAPEX_TOTAL_TAGS, US, MetricDef
 
 RESTATEMENT_TOL = 0.005
 ANNUAL_FORMS = {"10-K", "10-K/A", "10-K405", "10-KT", "10-KT/A", "20-F", "20-F/A", "40-F", "40-F/A"}
@@ -322,3 +322,59 @@ def lessor_revenue(revenue: MetricTable, lease: MetricTable, dq: DQLog) -> Metri
             severity="warning",
         )
     return MetricTable(revenue.metric, t)
+
+
+def capex_components(capex: MetricTable, components: dict[str, MetricTable], dq: DQLog) -> MetricTable:
+    """Capex for companies that split PP&E purchases over several cash-flow lines.
+
+    `components` maps each tag in CAPEX_COMPONENT_TAGS to its own single-tag table. When the line chosen
+    for a period is a component, the other component lines of the exact same period are added. When it
+    is a total tag but construction expenditures of the same period exceed it, the "total" tag holds a
+    smaller separate line (e.g. a utility's asset acquisitions) and the component lines are used instead.
+    """
+    t = capex.table
+    if t.empty or not components:
+        return capex
+    t = t.copy()
+    summed, replaced = 0, 0
+    construction = "PaymentsForConstructionInProcess"
+    for i in t.index:
+        tag = t.at[i, "tag"]
+        if t.at[i, "taxonomy"] != US or (tag not in CAPEX_COMPONENT_TAGS and tag not in CAPEX_TOTAL_TAGS):
+            continue
+        start, end = t.at[i, "start"], t.at[i, "end"]
+        parts = {}
+        for ctag, table in components.items():
+            row = table.get(start, end, tol=0)
+            if row is not None and row["value"]:
+                parts[ctag] = float(row["value"])
+        if tag in CAPEX_COMPONENT_TAGS:
+            extra = {k: v for k, v in parts.items() if k != tag}
+            if not extra:
+                continue
+            t.at[i, "value"] = float(t.at[i, "value"]) + sum(extra.values())
+            t.at[i, "first_value"] = float(t.at[i, "first_value"]) + sum(extra.values())
+            t.at[i, "tag"] = "derived: " + " + ".join([tag, *extra])
+            summed += 1
+        elif construction in parts and parts[construction] > float(t.at[i, "value"]):
+            t.at[i, "value"] = sum(parts.values())
+            t.at[i, "first_value"] = sum(parts.values())
+            t.at[i, "tag"] = "derived: " + " + ".join(parts) + f" (instead of {tag})"
+            replaced += 1
+    if summed:
+        dq.add(
+            "derived_value",
+            capex.metric.label,
+            f"{summed} period(s): PP&E purchases are split over several cash-flow lines ({', '.join(CAPEX_COMPONENT_TAGS)}); "
+            "capex = sum of the lines tagged for the same period.",
+            severity="warning",
+        )
+    if replaced:
+        dq.add(
+            "derived_value",
+            capex.metric.label,
+            f"{replaced} period(s): construction expenditures (PaymentsForConstructionInProcess) exceed the value tagged as total PP&E purchases, "
+            "so that tag holds a smaller separate line; capex = the construction/PP&E component lines of the same period.",
+            severity="warning",
+        )
+    return MetricTable(capex.metric, t)

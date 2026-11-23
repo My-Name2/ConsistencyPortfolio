@@ -241,3 +241,54 @@ def test_lessor_revenue_adds_lease_income_only_when_it_exceeds_contract_revenue(
     assert small.value(start, end) == pytest.approx(1_513.0)  # REIT-style: contract revenue is a small component
     total = lessor_revenue(MetricTable(METRICS["revenue"], table(contract, 2_800.0)), lease, DQLog())
     assert total.value(start, end) == pytest.approx(2_800.0)  # contract tag already holds total revenue
+
+
+def _move_capex(f, new_tag, share):
+    """Re-tag a share of every PP&E capex fact as a second cash-flow line (new_tag)."""
+    items = f["us-gaap"]["PaymentsToAcquirePropertyPlantAndEquipment"]["units"]["USD"]
+    f["us-gaap"][new_tag] = {"label": new_tag, "units": {"USD": [dict(i, val=i["val"] * share) for i in items]}}
+    return items
+
+
+def test_capex_split_over_component_lines_is_summed():
+    # Oil-and-gas style presentation: no PaymentsToAcquirePropertyPlantAndEquipment, two component lines.
+    def mutate(f):
+        items = _move_capex(f, "PaymentsToAcquireOtherPropertyPlantAndEquipment", 0.25)
+        f["us-gaap"]["PaymentsToAcquireOilAndGasPropertyAndEquipment"] = {"label": "og", "units": {"USD": [dict(i, val=i["val"] * 0.75) for i in items]}}
+        del f["us-gaap"]["PaymentsToAcquirePropertyPlantAndEquipment"]
+
+    r = _review_with(mutate)
+    row = row_for(r, "2024-06-30")
+    assert row["ttm_capex"] == pytest.approx(4 * fixture.CAPEX)
+    assert row["ttm_fcf"] == pytest.approx(row["ttm_ocf"] - 4 * fixture.CAPEX)
+    assert r.dq.frame()["detail"].str.contains("split over several cash-flow lines").any()
+
+
+def test_other_ppe_line_alone_is_capex():
+    def mutate(f):
+        _move_capex(f, "PaymentsToAcquireOtherPropertyPlantAndEquipment", 1.0)
+        del f["us-gaap"]["PaymentsToAcquirePropertyPlantAndEquipment"]
+
+    r = _review_with(mutate)
+    assert row_for(r, "2024-06-30")["ttm_capex"] == pytest.approx(4 * fixture.CAPEX)
+    assert r.dq.frame()["detail"].str.contains("PaymentsToAcquireOtherPropertyPlantAndEquipment used instead of PaymentsToAcquirePropertyPlantAndEquipment").any()
+
+
+def test_utility_construction_expenditures_replace_a_smaller_total_tag():
+    # Utility presentation: "construction expenditures" is the capex line; the PP&E tag holds small asset acquisitions.
+    def mutate(f):
+        items = _move_capex(f, "PaymentsForConstructionInProcess", 1.0)
+        for i in items:
+            i["val"] = i["val"] * 0.01
+
+    r = _review_with(mutate)
+    assert row_for(r, "2024-06-30")["ttm_capex"] == pytest.approx(4 * fixture.CAPEX)
+
+
+def test_construction_line_smaller_than_total_is_not_added():
+    # A construction-in-process disclosure below the PP&E total may be a breakdown of it: the total stands.
+    def mutate(f):
+        _move_capex(f, "PaymentsForConstructionInProcess", 0.4)
+
+    r = _review_with(mutate)
+    assert row_for(r, "2024-06-30")["ttm_capex"] == pytest.approx(4 * fixture.CAPEX)

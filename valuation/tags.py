@@ -114,11 +114,21 @@ METRICS: dict[str, MetricDef] = {
                 "PaymentsToAcquireProductiveAssets",
                 "PaymentsForCapitalImprovements",
                 "PaymentsToAcquireOtherProductiveAssets",
+                "PaymentsToAcquireOilAndGasPropertyAndEquipment",
+                "PaymentsToExploreAndDevelopOilAndGasProperties",
+                "PaymentsToAcquireOtherPropertyPlantAndEquipment",
+                "PaymentsForConstructionInProcess",
+                "PaymentsForProceedsFromProductiveAssets",
             ),
             ifrs=("PurchaseOfPropertyPlantAndEquipmentClassifiedAsInvestingActivities", "PurchaseOfPropertyPlantAndEquipment"),
             notes={
                 "PaymentsToAcquireProductiveAssets": "may include intangibles and other productive assets",
                 "PaymentsToAcquireOtherProductiveAssets": "'other productive assets' line used as capex (no PP&E capex tag for the period)",
+                "PaymentsToAcquireOilAndGasPropertyAndEquipment": "oil and gas property additions; other PP&E lines of the same period are added",
+                "PaymentsToAcquireOtherPropertyPlantAndEquipment": "'other PP&E' line; other PP&E lines of the same period are added",
+                "PaymentsToExploreAndDevelopOilAndGasProperties": "exploration and development additions; other PP&E lines of the same period are added",
+                "PaymentsForConstructionInProcess": "construction expenditures (utility/REIT presentation)",
+                "PaymentsForProceedsFromProductiveAssets": "net of disposal proceeds (the only capex line tagged)",
             },
         ),
         _m(
@@ -268,3 +278,18 @@ def all_tags_for(metric: MetricDef) -> list[tuple[str, str, int]]:
         for priority, tag in enumerate(tags):
             out.append((taxonomy, tag, priority))
     return out
+
+# Capex presentations that split PP&E purchases over several cash-flow lines. When the line chosen
+# for a period is one of the COMPONENT tags, the other component lines of the same period are added
+# (they are separate rows of the same statement, e.g. oil and gas additions + other PP&E, or capital
+# improvements + construction in process). A TOTAL tag is used alone, unless construction
+# expenditures for the same period exceed it (then the "total" tag holds a smaller separate line,
+# e.g. a utility's asset acquisitions, and construction expenditures are the capex line).
+CAPEX_TOTAL_TAGS = ("PaymentsToAcquirePropertyPlantAndEquipment", "PaymentsToAcquireProductiveAssets")
+CAPEX_COMPONENT_TAGS = (
+    "PaymentsToAcquireOilAndGasPropertyAndEquipment",
+    "PaymentsToExploreAndDevelopOilAndGasProperties",
+    "PaymentsToAcquireOtherPropertyPlantAndEquipment",
+    "PaymentsForCapitalImprovements",
+    "PaymentsForConstructionInProcess",
+)

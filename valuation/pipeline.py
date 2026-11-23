@@ -17,8 +17,8 @@ from .ratios import DAILY_RATIOS, NM, RATIOS, compute_all, is_extreme
 from .redflags import InputBDocument, data_flags, text_flags
 from .splits import SplitBasis, detect_splits
 from .stats import SERIES, stats_table
-from .tags import BALANCE_ANCHOR_METRICS, CALENDAR_METRICS, COVER_SHARES_TAG, DEBT_TAGS, DEI, IFRS, METRICS, US, MetricDef
-from .values import MetricTable, build_metric_table, derive_gross_profit, lessor_revenue, parent_equity, parent_share_of_profit_loss
+from .tags import BALANCE_ANCHOR_METRICS, CALENDAR_METRICS, CAPEX_COMPONENT_TAGS, COVER_SHARES_TAG, DEBT_TAGS, DEI, IFRS, METRICS, US, MetricDef
+from .values import MetricTable, build_metric_table, capex_components, derive_gross_profit, lessor_revenue, parent_equity, parent_share_of_profit_loss
 
 FLOW_KEYS = ["revenue", "gross_profit", "operating_income", "net_income", "ocf", "capex", "da", "dividends_paid", "impairment", "disc_ops", "disposal_gains"]
 TTM_COLUMNS = {
@@ -356,6 +356,8 @@ def run_review(inp: ReviewInputs) -> Review:
     tables["gross_profit"] = derive_gross_profit(tables["gross_profit"], tables["revenue"], tables["cost_of_revenue"], dq)
     tables["net_income"] = parent_share_of_profit_loss(tables["net_income"], tables["nci_income"], dq)
     tables["equity"] = parent_equity(tables["equity"], tables["nci"], dq)
+    capex_parts = {tag: build_metric_table(cf, MetricDef(f"capex:{tag}", tag, "duration", "money", True, {US: (tag,)}, {}), basis, DQLog()) for tag in CAPEX_COMPONENT_TAGS}
+    tables["capex"] = capex_components(tables["capex"], {k: v for k, v in capex_parts.items() if not v.table.empty}, dq)
     debt = {slot: build_metric_table(cf, _slot_metric(slot, {US: DEBT_TAGS[US][slot], IFRS: DEBT_TAGS[IFRS][slot]}), basis, DQLog()) for slot in DEBT_TAGS[US]}
 
     currencies = sorted(set(cf.filings["dominant_currency"].dropna()))
