@@ -123,6 +123,16 @@ METRICS: dict[str, MetricDef] = {
             ifrs=("CashFlowsFromUsedInOperatingActivities",),
             notes={"NetCashProvidedByUsedInOperatingActivitiesContinuingOperations": "continuing operations only"},
         ),
+        # Continuing-operations OCF: used instead of the total wherever both are tagged for a period
+        # (values.continuing_operations_ocf), so the series never mixes the two across periods.
+        _m(
+            "ocf_continuing", "Operating cash flow (continuing operations)", "duration", "money", True,
+            us=("NetCashProvidedByUsedInOperatingActivitiesContinuingOperations",),
+        ),
+        _m(
+            "ocf_discontinued", "Operating cash flow (discontinued operations)", "duration", "money", True,
+            us=("CashProvidedByUsedInOperatingActivitiesDiscontinuedOperations",),
+        ),
         _m(
             "capex", "Capital expenditures", "duration", "money", True,
             us=(

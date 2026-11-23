@@ -375,6 +375,71 @@ def parent_equity(equity: MetricTable, nci: MetricTable, dq: DQLog) -> MetricTab
     return MetricTable(equity.metric, t)
 
 
+CONTINUING_OCF_TAG = "NetCashProvidedByUsedInOperatingActivitiesContinuingOperations"
+_REPLACE_COLUMNS = (
+    "value", "value_reported", "unit", "accn", "filed", "form", "first_value", "first_accn", "first_filed", "first_form",
+    "n_filings", "restated", "tag", "ignored_quarterly_report_value",
+)
+
+
+def continuing_operations_ocf(ocf: MetricTable, cont: MetricTable, dq: DQLog, disc: MetricTable | None = None) -> MetricTable:
+    """Use continuing-operations OCF for every period where it is tagged alongside the total.
+
+    The total (NetCashProvidedByUsedInOperatingActivities) includes discontinued operations' cash flows.
+    Filers with discontinued operations often tag only the continuing line in some filings and both in
+    others, so preferring the total mixes the two across periods and inside YTD differencing (e.g.
+    Q2 = 6M total - 3M continuing), which puts spurious steps into the TTM series. Where the continuing
+    line is not tagged but discontinued-operations OCF is, continuing = total - discontinued.
+    """
+    t = ocf.table
+    c = cont.table
+    d = disc.table if disc is not None else pd.DataFrame()
+    if t.empty or (c.empty and d.empty):
+        return ocf
+    lookup = {(s, e): row for s, e, row in zip(c["start"], c["end"], c.to_dict("records"))} if not c.empty else {}
+    disc_lookup = {(s, e): row for s, e, row in zip(d["start"], d["end"], d.to_dict("records"))} if not d.empty else {}
+    t = t.copy()
+    replaced, ends = 0, []
+    derived, dends = 0, []
+    for i in t.index:
+        if t.at[i, "tag"] == CONTINUING_OCF_TAG:
+            continue
+        row = lookup.get((t.at[i, "start"], t.at[i, "end"]))
+        if row is None or row.get("taxonomy") != t.at[i, "taxonomy"]:
+            drow = disc_lookup.get((t.at[i, "start"], t.at[i, "end"]))
+            if t.at[i, "tag"] == "NetCashProvidedByUsedInOperatingActivities" and drow is not None and drow.get("taxonomy") == t.at[i, "taxonomy"] and float(drow["value"]):
+                t.at[i, "value"] = float(t.at[i, "value"]) - float(drow["value"])
+                t.at[i, "first_value"] = float(t.at[i, "first_value"]) - float(drow["value"])
+                t.at[i, "tag"] = f"derived: NetCashProvidedByUsedInOperatingActivities - {drow['tag']}"
+                derived += 1
+                dends.append(t.at[i, "end"])
+            continue
+        differs = abs(float(row["value"]) - float(t.at[i, "value"])) > RESTATEMENT_TOL * max(abs(float(row["value"])), abs(float(t.at[i, "value"])), 1.0)
+        for col in _REPLACE_COLUMNS:
+            if col in t.columns and col in row:
+                t.at[i, col] = row[col]
+        if differs:
+            replaced += 1
+            ends.append(t.at[i, "end"])
+    if replaced:
+        dq.add(
+            "fallback_tag",
+            ocf.metric.label,
+            f"{replaced} period(s) ending {min(ends).date()} to {max(ends).date()}: {CONTINUING_OCF_TAG} used instead of the total "
+            "NetCashProvidedByUsedInOperatingActivities, which includes discontinued operations (both tagged for the same period).",
+            severity="warning",
+        )
+    if derived:
+        dq.add(
+            "derived_value",
+            ocf.metric.label,
+            f"{derived} period(s) ending {min(dends).date()} to {max(dends).date()}: continuing-operations OCF = NetCashProvidedByUsedInOperatingActivities - "
+            "CashProvidedByUsedInOperatingActivitiesDiscontinuedOperations (both tagged for the same period; no continuing-operations tag).",
+            severity="warning",
+        )
+    return MetricTable(ocf.metric, t)
+
+
 def lessor_revenue(revenue: MetricTable, lease: MetricTable, dq: DQLog) -> MetricTable:
     """Total revenue for lessors that tag contract revenue and lease income separately but no total."""
     t = revenue.table

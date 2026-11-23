@@ -18,7 +18,7 @@ from .redflags import InputBDocument, data_flags, text_flags
 from .splits import SplitBasis, detect_splits
 from .stats import SERIES, stats_table
 from .tags import BALANCE_ANCHOR_METRICS, CALENDAR_METRICS, CAPEX_COMPONENT_TAGS, COVER_SHARES_TAG, DEBT_TAGS, DEI, IFRS, METRICS, US, MetricDef
-from .values import MetricTable, build_metric_table, capex_components, derive_gross_profit, lessor_revenue, parent_equity, parent_share_of_profit_loss, screen_component_cost_tags
+from .values import MetricTable, build_metric_table, capex_components, continuing_operations_ocf, derive_gross_profit, lessor_revenue, parent_equity, parent_share_of_profit_loss, screen_component_cost_tags
 
 FLOW_KEYS = ["revenue", "gross_profit", "operating_income", "net_income", "ocf", "capex", "da", "dividends_paid", "impairment", "disc_ops", "disposal_gains"]
 TTM_COLUMNS = {
@@ -360,6 +360,7 @@ def run_review(inp: ReviewInputs) -> Review:
     tables["equity"] = parent_equity(tables["equity"], tables["nci"], dq)
     capex_parts = {tag: build_metric_table(cf, MetricDef(f"capex:{tag}", tag, "duration", "money", True, {US: (tag,)}, {}), basis, DQLog()) for tag in CAPEX_COMPONENT_TAGS}
     tables["capex"] = capex_components(tables["capex"], {k: v for k, v in capex_parts.items() if not v.table.empty}, dq)
+    tables["ocf"] = continuing_operations_ocf(tables["ocf"], tables["ocf_continuing"], dq, tables["ocf_discontinued"])
     debt = {slot: build_metric_table(cf, _slot_metric(slot, {US: DEBT_TAGS[US][slot], IFRS: DEBT_TAGS[IFRS][slot]}), basis, DQLog()) for slot in DEBT_TAGS[US]}
 
     currencies = sorted(set(cf.filings["dominant_currency"].dropna()))

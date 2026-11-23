@@ -389,3 +389,43 @@ def test_unconfirmed_purchased_oil_and_gas_is_not_used_as_cost_of_revenue():
 
     row = row_for(_review_with(confirmed), "2021-12-31")
     assert row["ttm_gross_profit"] == pytest.approx(0.6 * row["ttm_revenue"])  # agrees with the later total in 2023
+
+def test_continuing_operations_ocf_preferred_over_total_when_both_tagged():
+    # Fiscal 2023 has a discontinued operation: filings tag the total and the continuing-operations line;
+    # continuing OCF is 1,000 lower per quarter. Fiscal 2024 tags only the total (no discontinued operations).
+    cont = "NetCashProvidedByUsedInOperatingActivitiesContinuingOperations"
+
+    def mutate(f):
+        items = []
+        for item in f["us-gaap"]["NetCashProvidedByUsedInOperatingActivities"]["units"]["USD"]:
+            if item.get("start") == "2023-01-01":
+                k = {"2023-03-31": 1, "2023-06-30": 2, "2023-09-30": 3, "2023-12-31": 4}[item["end"]]
+                items.append(dict(item, val=item["val"] - 1_000.0 * k))
+        f["us-gaap"][cont] = {"label": cont, "units": {"USD": items}}
+
+    r = _review_with(mutate)
+    fy2023 = sum(fixture.ocf(2023, k) for k in (1, 2, 3, 4))
+    assert row_for(r, "2023-12-31")["ttm_ocf"] == pytest.approx(fy2023 - 4_000.0)
+    # FY2023 (continuing) + 6M 2024 (total) - 6M 2023 (continuing) = Q3/Q4 2023 continuing + Q1/Q2 2024
+    quarters = [(2023, 3), (2023, 4), (2024, 1), (2024, 2)]
+    assert row_for(r, "2024-06-30")["ttm_ocf"] == pytest.approx(sum(fixture.ocf(*q) for q in quarters) - 2_000.0)
+    dq = r.dq.frame()
+    assert dq["detail"].str.contains(f"{cont} used instead of the total").any()
+
+
+def test_continuing_ocf_derived_from_total_minus_discontinued():
+    # Only the total and discontinued-operations OCF are tagged for fiscal 2023 (discontinued outflow 500 per quarter).
+    disc = "CashProvidedByUsedInOperatingActivitiesDiscontinuedOperations"
+
+    def mutate(f):
+        items = []
+        for item in f["us-gaap"]["NetCashProvidedByUsedInOperatingActivities"]["units"]["USD"]:
+            if item.get("start") == "2023-01-01":
+                k = {"2023-03-31": 1, "2023-06-30": 2, "2023-09-30": 3, "2023-12-31": 4}[item["end"]]
+                items.append(dict(item, val=-500.0 * k))
+        f["us-gaap"][disc] = {"label": disc, "units": {"USD": items}}
+
+    r = _review_with(mutate)
+    fy2023 = sum(fixture.ocf(2023, k) for k in (1, 2, 3, 4))
+    assert row_for(r, "2023-12-31")["ttm_ocf"] == pytest.approx(fy2023 + 2_000.0)
+    assert r.dq.frame()["detail"].str.contains("continuing-operations OCF = NetCashProvidedByUsedInOperatingActivities - ").any()
