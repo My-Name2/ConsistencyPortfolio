@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+# Review outputs are written only to an --out-dir off the C: drive; never commit them.
+*_valuation.xlsx
+*_report.md
+batch_summary_*.csv

@@ -2,3 +2,5 @@ streamlit>=1.37,<2
 pandas>=2.2,<3
 requests>=2.32,<3
 yfinance>=0.2.65,<0.3
+altair>=5,<7
+openpyxl>=3.1,<4
