@@ -376,3 +376,16 @@ def test_component_cost_tag_is_not_used_as_total_cost_of_revenue():
     assert old["ttm_gross_profit"] == pytest.approx(0.6 * old["ttm_revenue"])
     assert pd.isna(new["ttm_gross_profit"])  # missing, not revenue minus a component
     assert r.dq.frame()["detail"].str.contains(f"{component} not used").any()
+
+
+def test_unconfirmed_purchased_oil_and_gas_is_not_used_as_cost_of_revenue():
+    r = _review_with(lambda f: _cost_facts(f, "CostOfPurchasedOilAndGas", 0.1))
+    assert pd.isna(row_for(r, "2024-12-31")["ttm_gross_profit"])  # gas purchased alone is not cost of revenue
+    assert r.dq.frame()["detail"].str.contains("CostOfPurchasedOilAndGas not used: no period").any()
+
+    def confirmed(f):
+        _cost_facts(f, "CostOfGoodsAndServicesSold", 0.4, keep=lambda i: i["end"] >= "2023-01-01")
+        _cost_facts(f, "CostOfPurchasedOilAndGas", 0.4, keep=lambda i: i["end"] <= "2023-12-31")
+
+    row = row_for(_review_with(confirmed), "2021-12-31")
+    assert row["ttm_gross_profit"] == pytest.approx(0.6 * row["ttm_revenue"])  # agrees with the later total in 2023

@@ -288,6 +288,11 @@ COMPONENT_SCREENED_COST_TAGS = frozenset(
     }
 )
 
+# Screened tags that are used only when at least one period confirms them against a higher-priority cost tag or
+# revenue minus GrossProfit (as for CVX, COP and PSX before 2017); without that, they are often a single component
+# (a utility's gas purchased, a REIT's service costs).
+CONFIRMATION_REQUIRED_COST_TAGS = frozenset({"CostOfPurchasedOilAndGas", "CostOfServicesExcludingDepreciationDepletionAndAmortization"})
+
 SPLIT_RATIO_TAGS = ("StockholdersEquityNoteStockSplitConversionRatio1",)
 COVER_SHARES_TAG = "EntityCommonStockSharesOutstanding"
 

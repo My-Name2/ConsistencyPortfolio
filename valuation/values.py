@@ -212,11 +212,14 @@ def build_metric_table(cf: CompanyFacts, metric: MetricDef, basis: SplitBasis, d
 COMPONENT_TOL = 0.005
 
 
-def _first_conflict(table: pd.DataFrame, references: list[pd.DataFrame]) -> tuple | None:
-    """First period where `table` and a reference table both have a value and differ by more than COMPONENT_TOL."""
+def _first_conflict(table: pd.DataFrame, references: list[pd.DataFrame], overlaps: list | None = None) -> tuple | None:
+    """First period where `table` and a reference table both have a value and differ by more than COMPONENT_TOL.
+    The number of overlapping periods is appended to `overlaps` when given."""
     mine = table[["start", "end", "value"]]
     for ref in references:
         both = mine.merge(ref[["start", "end", "value", "tag"]], on=["start", "end"], suffixes=("", "_ref"))
+        if overlaps is not None:
+            overlaps.append(len(both))
         if both.empty:
             continue
         a, b = both["value"].astype(float), both["value_ref"].astype(float)
@@ -236,7 +239,7 @@ def screen_component_cost_tags(cf: CompanyFacts, metric: MetricDef, gross_profit
     GrossProfit. A tag with no overlapping period is kept (nothing contradicts it) and is logged as a fallback
     when used.
     """
-    from .tags import COMPONENT_SCREENED_COST_TAGS
+    from .tags import COMPONENT_SCREENED_COST_TAGS, CONFIRMATION_REQUIRED_COST_TAGS
 
     candidates: dict[str, tuple[str, ...]] = {}
     for taxonomy, tags in metric.candidates.items():
@@ -253,7 +256,17 @@ def screen_component_cost_tags(cf: CompanyFacts, metric: MetricDef, gross_profit
         kept = []
         for tag in tags:
             table = raw_tag_table(cf, taxonomy, tag, metric.kind, metric.unit, basis)
-            conflict = _first_conflict(table, references) if tag in COMPONENT_SCREENED_COST_TAGS and not table.empty else None
+            overlaps: list[int] = []
+            conflict = _first_conflict(table, references, overlaps) if tag in COMPONENT_SCREENED_COST_TAGS and not table.empty else None
+            if conflict is None and tag in CONFIRMATION_REQUIRED_COST_TAGS and not table.empty and sum(overlaps) == 0:
+                dq.add(
+                    "fallback_tag",
+                    metric.label,
+                    f"{taxonomy}:{tag} not used: no period where it can be confirmed against a total cost-of-revenue line or revenue minus "
+                    "GrossProfit, and for many filers it is only one component (e.g. gas purchased).",
+                    severity="info",
+                )
+                continue
             if not table.empty:
                 # Every higher-priority line is a reference, used or not: two different cost lines for the
                 # same period mean the later one is not the total.
