@@ -217,10 +217,15 @@ class BalanceSheet:
         else:
             basic = self.tables["basic_shares"].table
             if not basic.empty:
-                recent = basic[(basic["end"] <= instant) & (basic["end"] > instant - pd.Timedelta(days=3)) & (basic["days"].between(80, 125))]
-                if not recent.empty:
-                    row = recent.iloc[-1].to_dict()
+                at_instant = basic[(basic["end"] <= instant) & (basic["end"] > instant - pd.Timedelta(days=3))]
+                quarter = at_instant[at_instant["days"].between(80, 125)]
+                annual = at_instant[at_instant["days"].between(350, 380)]
+                if not quarter.empty:
+                    row = quarter.iloc[-1].to_dict()
                     source = f"{row['tag']} 3-month weighted basic (fallback)"
+                elif not annual.empty:
+                    row = annual.iloc[-1].to_dict()
+                    source = f"{row['tag']} fiscal-year weighted basic (fallback)"
         if row is not None:
             if not self._logged_fallback:
                 self._logged_fallback = True
@@ -775,7 +780,11 @@ def _snapshot_table(review: Review) -> tuple[pd.DataFrame, dict]:
             if len(hist):
                 pct = 100.0 * float((hist <= value).sum()) / len(hist)
                 percentiles[ratio.key] = {"percentile": pct, "n": int(len(hist)), "from": hist.index.min(), "to": hist.index.max()}
-        rows.append({"group": "Price ratios", "key": ratio.key, "item": ratio.label, "value": value, "unit": ratio.kind, "valuation_date": last["valuation_date"], "inputs": f"price {snap.get('price_date').date() if snap.get('price_date') is not None else '-'}; TTM ending {last['quarter_end'].date()}; balance sheet {snap.get('bs_instant').date() if snap.get('bs_instant') is not None else '-'}", "formula": ratio.formula, "shares": ratio.shares, "percentile": pct, "reason": reason})
+        shares_note = ratio.shares
+        source = snap.get("shares_source") or ""
+        if source and not source.startswith("dei:"):
+            shares_note = shares_note.replace("cover-page shares outstanding", source)
+        rows.append({"group": "Price ratios", "key": ratio.key, "item": ratio.label, "value": value, "unit": ratio.kind, "valuation_date": last["valuation_date"], "inputs": f"price {snap.get('price_date').date() if snap.get('price_date') is not None else '-'}; TTM ending {last['quarter_end'].date()}; balance sheet {snap.get('bs_instant').date() if snap.get('bs_instant') is not None else '-'}", "formula": ratio.formula, "shares": shares_note, "percentile": pct, "reason": reason})
     return pd.DataFrame(rows), percentiles
 
 

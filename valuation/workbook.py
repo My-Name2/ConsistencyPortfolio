@@ -523,7 +523,7 @@ def _write_snapshot(sh: Sheet, review, tq, last_row: int):
     sh.header(4, ["Input", "Value", "Date", "Source / note"])
     inputs = [
         ("price", "Price (as-of split basis)", snap.get("price"), "per_share", snap.get("price_date"), snap.get("price_source") or snap.get("price_reason", "")),
-        ("shares", "Shares outstanding (cover page, as-of basis)", snap.get("shares_out"), "shares", snap.get("cover_date"), f"{snap.get('cover_form', '')} {snap.get('cover_accn', '')}; split factor {snap.get('share_factor', '')}"),
+        ("shares", "Shares outstanding (as-of split basis)", snap.get("shares_out"), "shares", snap.get("cover_date"), f"{snap.get('shares_source', '')}; {snap.get('cover_form', '')} {snap.get('cover_accn', '')}; split factor {snap.get('share_factor', '')}"),
         ("cash", "Cash & equivalents", snap.get("cash"), "money", snap.get("bs_instant"), f"{snap.get('bs_form', '')} {snap.get('bs_accn', '')}"),
         ("debt", "Total borrowings (current + noncurrent, as tagged)", snap.get("total_borrowings"), "money", snap.get("bs_instant"), snap.get("borrowings_note") or f"current: {snap.get('debt_current_tag') or '-'}; noncurrent: {snap.get('debt_noncurrent_tag') or '-'}"),
         ("nci", "Noncontrolling interest", snap.get("nci"), "money", snap.get("bs_instant"), "" if snap.get("nci") is not None else "not tagged (excluded from EV)"),

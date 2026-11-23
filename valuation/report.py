@@ -118,18 +118,25 @@ def build_report(review, workbook_path: str | None = None, full_dq: bool = True)
     # 4. Snapshot
     parts.append("\n## 4. Current snapshot\n")
     price = snap.get("price")
+    money = lambda key: (fmt_value(snap.get(key), "money") + " m") if _num(snap.get(key)) else "not tagged"  # noqa: E731
+    source = snap.get("shares_source") or ""
+    where = f"cover page {_d(snap.get('cover_date'))}" if source.startswith("dei:") else (source or "no share count")
     parts.append(
-        f"Price {fmt_value(price, 'per_share')} on {_d(snap.get('price_date'))} ({snap.get('price_source') or snap.get('price_reason', '')}); "
-        f"shares outstanding {fmt_value(snap.get('shares_out'), 'shares')} million (cover page {_d(snap.get('cover_date'))}, {snap.get('cover_accn', '')}); "
-        f"market cap {fmt_value(snap.get('mcap'), 'money')} million; EV {fmt_value(snap.get('ev'), 'money')} million "
-        f"(borrowings {fmt_value(snap.get('total_borrowings'), 'money')}, NCI {fmt_value(snap.get('nci'), 'money') or 'not tagged'}, preferred {fmt_value(snap.get('preferred'), 'money') or 'not tagged'}, "
-        f"cash {fmt_value(snap.get('cash'), 'money')}; balance sheet {_d(snap.get('bs_instant'))}, {snap.get('bs_accn', '')}). "
+        f"Price {fmt_value(price, 'per_share') or 'n/a'} on {_d(snap.get('price_date'))} ({snap.get('price_source') or snap.get('price_reason', '')}); "
+        f"shares outstanding {fmt_value(snap.get('shares_out'), 'shares') or 'n/a'} million ({where}; {snap.get('cover_accn', '')}); "
+        f"market cap {money('mcap') if _num(snap.get('mcap')) else 'n/a'}; EV {money('ev') if _num(snap.get('ev')) else 'n/a (' + (snap.get('ev_reason') or '') + ')'} "
+        f"= market cap + borrowings {money('total_borrowings')} + NCI {money('nci')} + preferred {money('preferred')} - cash {money('cash')} "
+        f"(balance sheet {_d(snap.get('bs_instant'))}, {snap.get('bs_accn', '')}; untagged components are excluded). "
         "Lease liabilities and short-term investments are excluded from EV.\n"
     )
     s = review.snapshot
     if not s.empty:
         ttm_rows = s[s["group"] != "Price ratios"]
-        parts.append(_table(["TTM / per-share item", "Value", "Valuation date", "Inputs"], [[r["item"], fmt_value(r["value"], r["unit"]) if r["unit"] != "money" else fmt_value(r["value"], "money") + " m", _d(r["valuation_date"]), r["inputs"] or r["reason"] or ""] for _, r in ttm_rows.iterrows()]))
+        def shown(r):
+            text = fmt_value(r["value"], r["unit"])
+            return text + " m" if text and r["unit"] in ("money", "shares") else text
+
+        parts.append(_table(["TTM / per-share item", "Value", "Valuation date", "Inputs"], [[r["item"], shown(r), _d(r["valuation_date"]), r["inputs"] or r["reason"] or ""] for _, r in ttm_rows.iterrows()]))
         rows = []
         for _, r in s[s["group"] == "Price ratios"].iterrows():
             pct = review.percentiles.get(r["key"])
