@@ -9,7 +9,7 @@ For each period (start/end for durations, end for instants):
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 import pandas as pd
@@ -207,6 +207,70 @@ def build_metric_table(cf: CompanyFacts, metric: MetricDef, basis: SplitBasis, d
             filing=row["accn"],
         )
     return MetricTable(metric, chosen)
+
+
+COMPONENT_TOL = 0.005
+
+
+def _first_conflict(table: pd.DataFrame, references: list[pd.DataFrame]) -> tuple | None:
+    """First period where `table` and a reference table both have a value and differ by more than COMPONENT_TOL."""
+    mine = table[["start", "end", "value"]]
+    for ref in references:
+        both = mine.merge(ref[["start", "end", "value", "tag"]], on=["start", "end"], suffixes=("", "_ref"))
+        if both.empty:
+            continue
+        a, b = both["value"].astype(float), both["value_ref"].astype(float)
+        scale = pd.concat([a.abs(), b.abs()], axis=1).max(axis=1).replace(0, np.nan)
+        bad = both[((a - b).abs() / scale > COMPONENT_TOL).fillna(False)]
+        if not bad.empty:
+            row = bad.sort_values("end").iloc[-1]
+            return row["tag"], row["start"], row["end"], float(row["value"]), float(row["value_ref"])
+    return None
+
+
+def screen_component_cost_tags(cf: CompanyFacts, metric: MetricDef, gross_profit: MetricDef, revenue: MetricTable, basis: SplitBasis, dq: DQLog) -> MetricDef:
+    """Drop, for this company, cost-of-revenue fallback tags that are shown to be only a component of cost of sales.
+
+    A screened tag (tags.COMPONENT_SCREENED_COST_TAGS) is kept only if, in every period where it and a
+    higher-priority cost tag are both reported, the two agree, and likewise against revenue minus tagged
+    GrossProfit. A tag with no overlapping period is kept (nothing contradicts it) and is logged as a fallback
+    when used.
+    """
+    from .tags import COMPONENT_SCREENED_COST_TAGS
+
+    candidates: dict[str, tuple[str, ...]] = {}
+    for taxonomy, tags in metric.candidates.items():
+        references: list[pd.DataFrame] = []
+        if not revenue.table.empty:
+            for gp_tag in gross_profit.candidates.get(taxonomy, ()):
+                gp = raw_tag_table(cf, taxonomy, gp_tag, gross_profit.kind, gross_profit.unit, basis)
+                if gp.empty:
+                    continue
+                implied = revenue.table[["start", "end", "value"]].merge(gp[["start", "end", "value"]], on=["start", "end"], suffixes=("_rev", "_gp"))
+                if not implied.empty:
+                    implied = implied.assign(value=implied["value_rev"] - implied["value_gp"], tag=f"revenue - {gp_tag}")
+                    references.append(implied[["start", "end", "value", "tag"]])
+        kept = []
+        for tag in tags:
+            table = raw_tag_table(cf, taxonomy, tag, metric.kind, metric.unit, basis)
+            conflict = _first_conflict(table, references) if tag in COMPONENT_SCREENED_COST_TAGS and not table.empty else None
+            if not table.empty:
+                # Every higher-priority line is a reference, used or not: two different cost lines for the
+                # same period mean the later one is not the total.
+                references.append(table[["start", "end", "value", "tag"]])
+            if conflict is not None:
+                ref_tag, start, end, value, ref_value = conflict
+                dq.add(
+                    "fallback_tag",
+                    metric.label,
+                    f"{taxonomy}:{tag} not used: for {start.date()}..{end.date()} it is {value:,.6g} while {ref_tag} is {ref_value:,.6g}, "
+                    "so it covers only part of cost of revenue for this company.",
+                    severity="info",
+                )
+                continue
+            kept.append(tag)
+        candidates[taxonomy] = tuple(kept)
+    return replace(metric, candidates=candidates)
 
 
 def derive_gross_profit(gp: MetricTable, revenue: MetricTable, cost: MetricTable, dq: DQLog) -> MetricTable:

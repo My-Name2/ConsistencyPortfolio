@@ -18,7 +18,7 @@ from .redflags import InputBDocument, data_flags, text_flags
 from .splits import SplitBasis, detect_splits
 from .stats import SERIES, stats_table
 from .tags import BALANCE_ANCHOR_METRICS, CALENDAR_METRICS, CAPEX_COMPONENT_TAGS, COVER_SHARES_TAG, DEBT_TAGS, DEI, IFRS, METRICS, US, MetricDef
-from .values import MetricTable, build_metric_table, capex_components, derive_gross_profit, lessor_revenue, parent_equity, parent_share_of_profit_loss
+from .values import MetricTable, build_metric_table, capex_components, derive_gross_profit, lessor_revenue, parent_equity, parent_share_of_profit_loss, screen_component_cost_tags
 
 FLOW_KEYS = ["revenue", "gross_profit", "operating_income", "net_income", "ocf", "capex", "da", "dividends_paid", "impairment", "disc_ops", "disposal_gains"]
 TTM_COLUMNS = {
@@ -351,8 +351,10 @@ def run_review(inp: ReviewInputs) -> Review:
         if meta.dividend_adjusted is None:
             dq.add("price_basis", "dividend basis not stated", "Input C does not state whether closes are dividend-adjusted; treated as traded closes.", severity="warning")
 
-    tables = {key: build_metric_table(cf, METRICS[key], basis, dq) for key in METRICS}
+    tables = {key: build_metric_table(cf, METRICS[key], basis, dq) for key in METRICS if key != "cost_of_revenue"}
     tables["revenue"] = lessor_revenue(tables["revenue"], tables["lease_income"], dq)
+    cost_metric = screen_component_cost_tags(cf, METRICS["cost_of_revenue"], METRICS["gross_profit"], tables["revenue"], basis, dq)
+    tables["cost_of_revenue"] = build_metric_table(cf, cost_metric, basis, dq)
     tables["gross_profit"] = derive_gross_profit(tables["gross_profit"], tables["revenue"], tables["cost_of_revenue"], dq)
     tables["net_income"] = parent_share_of_profit_loss(tables["net_income"], tables["nci_income"], dq)
     tables["equity"] = parent_equity(tables["equity"], tables["nci"], dq)

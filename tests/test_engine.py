@@ -345,3 +345,34 @@ def test_four_quarter_chain_runs_through_a_transition_period():
     chain = cal.previous_quarters(q2_2013, 4)
     assert chain is not None
     assert [q.end.date().isoformat() for q in chain] == ["2012-09-30", "2012-12-31", "2013-03-31", "2013-06-30"]
+
+def _cost_facts(f, tag, share, keep=lambda item: True):
+    """Copy every Revenues fact into a cost tag at `share` of revenue (same periods, filings and forms)."""
+    items = [dict(i, val=share * i["val"]) for i in f["us-gaap"]["Revenues"]["units"]["USD"] if keep(i)]
+    f["us-gaap"][tag] = {"label": tag, "units": {"USD": items}}
+
+
+def test_gross_profit_from_cost_of_sales_excluding_dda():
+    tag = "CostOfGoodsAndServiceExcludingDepreciationDepletionAndAmortization"
+    r = _review_with(lambda f: _cost_facts(f, tag, 0.4))
+    for q in ("2024-12-31", "2025-06-30"):
+        row = row_for(r, q)
+        assert row["ttm_gross_profit"] == pytest.approx(0.6 * row["ttm_revenue"])
+    dq = r.dq.frame()
+    assert dq["detail"].str.contains(f"{tag} used instead of CostOfRevenue").any()
+    assert dq["detail"].str.contains("excluding depreciation, depletion and amortization").any()
+
+
+def test_component_cost_tag_is_not_used_as_total_cost_of_revenue():
+    component = "CostOfGoodsSoldExcludingDepreciationDepletionAndAmortization"
+
+    def mutate(f):
+        # Total cost of revenue is tagged only through fiscal 2022; an equipment-only component is tagged throughout.
+        _cost_facts(f, "CostOfRevenue", 0.4, keep=lambda i: i["end"] <= "2022-12-31")
+        _cost_facts(f, component, 0.1)
+
+    r = _review_with(mutate)
+    old, new = row_for(r, "2022-12-31"), row_for(r, "2024-12-31")
+    assert old["ttm_gross_profit"] == pytest.approx(0.6 * old["ttm_revenue"])
+    assert pd.isna(new["ttm_gross_profit"])  # missing, not revenue minus a component
+    assert r.dq.frame()["detail"].str.contains(f"{component} not used").any()

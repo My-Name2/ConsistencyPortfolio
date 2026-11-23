@@ -55,8 +55,24 @@ METRICS: dict[str, MetricDef] = {
         ),
         _m(
             "cost_of_revenue", "Cost of revenue", "duration", "money", True,
-            us=("CostOfRevenue", "CostOfGoodsAndServicesSold", "CostOfGoodsSold", "CostOfServices"),
+            us=(
+                "CostOfRevenue",
+                "CostOfGoodsAndServicesSold",
+                "CostOfGoodsSold",
+                "CostOfServices",
+                # Further cost-of-sales lines; each is screened per company as a possible component (see COMPONENT_SCREENED_COST_TAGS).
+                "CostOfGoodsAndServiceExcludingDepreciationDepletionAndAmortization",
+                "CostOfGoodsSoldExcludingDepreciationDepletionAndAmortization",
+                "CostOfServicesExcludingDepreciationDepletionAndAmortization",
+                "CostOfPurchasedOilAndGas",
+            ),
             ifrs=("CostOfSales",),
+            notes={
+                "CostOfGoodsAndServiceExcludingDepreciationDepletionAndAmortization": "cost of sales excluding depreciation, depletion and amortization; gross profit is before D&A",
+                "CostOfGoodsSoldExcludingDepreciationDepletionAndAmortization": "cost of goods sold excluding depreciation, depletion and amortization; gross profit is before D&A",
+                "CostOfServicesExcludingDepreciationDepletionAndAmortization": "cost of services excluding depreciation, depletion and amortization; gross profit is before D&A",
+                "CostOfPurchasedOilAndGas": "purchased crude oil, gas and products (the cost-of-sales line of energy filers)",
+            },
         ),
         _m("gross_profit", "Gross profit", "duration", "money", True, us=("GrossProfit",), ifrs=("GrossProfit",)),
         _m(
@@ -259,6 +275,18 @@ DEBT_TAGS = {
         "ltd_total": ("Borrowings",),
     },
 }
+
+# Cost-of-revenue fallbacks that some filers use for a single component of cost of sales (e.g. equipment
+# cost only). Per company, such a tag is used only if it never disagrees with a higher-priority cost tag,
+# or with revenue minus tagged GrossProfit, in a period both report (values.screen_component_cost_tags).
+COMPONENT_SCREENED_COST_TAGS = frozenset(
+    {
+        "CostOfGoodsAndServiceExcludingDepreciationDepletionAndAmortization",
+        "CostOfGoodsSoldExcludingDepreciationDepletionAndAmortization",
+        "CostOfServicesExcludingDepreciationDepletionAndAmortization",
+        "CostOfPurchasedOilAndGas",
+    }
+)
 
 SPLIT_RATIO_TAGS = ("StockholdersEquityNoteStockSplitConversionRatio1",)
 COVER_SHARES_TAG = "EntityCommonStockSharesOutstanding"
