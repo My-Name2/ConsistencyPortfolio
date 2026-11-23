@@ -5,3 +5,5 @@ __pycache__/
 *_valuation.xlsx
 *_report.md
 batch_summary_*.csv
+# Agent worktrees and local Claude Code state (temporary, never committed)
+.claude/worktrees/
