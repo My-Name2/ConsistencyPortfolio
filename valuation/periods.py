@@ -184,12 +184,14 @@ def build_calendar(tables: list[MetricTable], dq: DQLog, as_of: pd.Timestamp) ->
         if cleaned and cleaned[-1].end is not None and fy.start + TOL <= cleaned[-1].end:
             continue
         if cleaned and cleaned[-1].end is None:
-            # A provisional year (a transition period, or a year without an annual value) ends where the next
-            # year starts; quarter ends it borrowed from beyond that boundary belong to the next year.
+            # A provisional year that precedes the next year (a transition period, or a year without an annual
+            # value) ends where the next year starts; quarter ends it borrowed from beyond that boundary belong
+            # to the next year. A provisional year with no quarter before that boundary is a parallel calendar
+            # (e.g. a predecessor's fiscal quarters in the same filings) and is left as it is.
             prev = cleaned[-1]
-            prev.quarter_ends = {k: v for k, v in prev.quarter_ends.items() if v <= fy.start - pd.Timedelta(days=1) + TOL}
-            if not prev.quarter_ends:
-                cleaned.pop()
+            before = {k: v for k, v in prev.quarter_ends.items() if v <= fy.start - pd.Timedelta(days=1) + TOL}
+            if before:
+                prev.quarter_ends = before
         cleaned.append(fy)
     years = cleaned
     for i, fy in enumerate(years):
