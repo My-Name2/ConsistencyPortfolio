@@ -408,6 +408,7 @@ def _valuation_rows(cf, cal: Calendar, tables, qv, qv_shares, bs: BalanceSheet, 
         triggers.append((quarter, f.filed, f.accn, f.form, f.regime_taxonomy, f.dominant_currency))
 
     fy_fallback: list[pd.Timestamp] = []
+    fx_rows: list[pd.Timestamp] = []
     for quarter, filed, accn, form, taxonomy, currency in triggers:
         row = {
             "quarter_end": quarter.end,
@@ -475,9 +476,15 @@ def _valuation_rows(cf, cal: Calendar, tables, qv, qv_shares, bs: BalanceSheet, 
         so = row.get("shares_out")
         row["bvps"] = row["equity"] / so if _num(row.get("equity")) and _num(so) and so > 0 else None
 
+        price_currency = prices.meta.currency if prices is not None else ""
+        row["currency_ok"] = not (price_currency and currency and price_currency != currency)
         if prices is None:
             lookup_reason = "no price data"
             row.update(price=None, price_date=None, raw_price=None, price_factor=None)
+        elif not row["currency_ok"]:
+            lookup_reason = f"fundamentals reported in {currency}, price in {price_currency}; no FX input"
+            row.update(price=None, price_date=None, raw_price=None, price_factor=None)
+            fx_rows.append(quarter.end)
         elif price_block:
             lookup_reason = price_block
             row.update(price=None, price_date=None, raw_price=None, price_factor=None)
@@ -491,6 +498,14 @@ def _valuation_rows(cf, cal: Calendar, tables, qv, qv_shares, bs: BalanceSheet, 
         _market_values(row)
         row["notes"] = "; ".join(r for r in reasons if r)
         rows.append(row)
+    if fx_rows:
+        dq.add(
+            "price_basis",
+            "currency mismatch by period",
+            f"{len(fx_rows)} valuation date(s) (TTM ends {fx_rows[0].date()} to {fx_rows[-1].date()}) report fundamentals in a currency other than Input C's "
+            f"{prices.meta.currency} prices. No FX input was supplied, so price ratios for those dates (and the daily days they cover) are blank.",
+            severity="warning",
+        )
     if fy_fallback:
         dq.add(
             "shares_method",
@@ -643,10 +658,20 @@ def _coverage(cal: Calendar, tables, cf: CompanyFacts, prices, as_of) -> tuple[p
 
 
 def _missing_periods(cal: Calendar, ttm: pd.DataFrame, dq: DQLog) -> None:
+    annual_only = []
     for fy in cal.years:
         missing = [k for k in (1, 2, 3, 4) if k not in fy.quarter_ends]
-        if fy.end is not None and missing and len(missing) < 4:
+        if fy.end is not None and missing == [1, 2, 3]:
+            annual_only.append(fy)
+        elif fy.end is not None and missing and len(missing) < 4:
             dq.add("missing_period", "fiscal quarter end not identified", f"{fy.label}: no period data ends Q{', Q'.join(map(str, missing))}; those quarters and the TTM values that need them are blank.", period=fy.end)
+    if annual_only:
+        dq.add(
+            "missing_period",
+            "annual-only reporting",
+            f"{len(annual_only)} fiscal year(s) ({annual_only[0].label} to {annual_only[-1].label}) have no interim XBRL periods (e.g. 20-F/40-F filers). "
+            "Those years contribute one fiscal-year-end valuation date each (TTM = FY); no quarters are derived.",
+        )
 
 
 def _growth(annual: pd.DataFrame, ttm: pd.DataFrame) -> pd.DataFrame:
@@ -727,6 +752,12 @@ SNAPSHOT_FIELDS = [
 ]
 
 
+def _text(src: dict, key: str) -> str:
+    """A reason or note field as text; NaN and None become ''."""
+    v = src.get(key)
+    return v if isinstance(v, str) else ""
+
+
 def ratio_inputs(row: dict | pd.Series, snap: dict | None = None) -> dict:
     """Map a TTM row (and optional snapshot market inputs) to ratio numerator/denominator names."""
     src = dict(row)
@@ -741,16 +772,16 @@ def ratio_inputs(row: dict | pd.Series, snap: dict | None = None) -> dict:
         "eps": clean.get("eps_ttm"), "revenue": clean.get("ttm_revenue"), "gross_profit": clean.get("ttm_gross_profit"),
         "equity": clean.get("equity"), "tbv": clean.get("tbv"), "ocf": clean.get("ttm_ocf"), "fcf": clean.get("ttm_fcf"),
         "dps": clean.get("dps_ttm"), "operating_income": clean.get("ttm_operating_income"), "ebitda": clean.get("ttm_ebitda"),
-        "bvps": clean.get("bvps"), "cagr": clean.get("eps_cagr5"), "cagr_reason": src.get("eps_cagr5_reason"),
-        "price_reason": src.get("price_reason") or "price unavailable",
-        "mcap_reason": src.get("price_reason") or ("no shares outstanding available for market cap" if not _num(src.get("shares_out")) else "market cap unavailable"),
-        "ev_reason": src.get("ev_reason") or "EV unavailable", "tbv_reason": src.get("tbv_reason") or "TBV unavailable",
-        "dps_reason": src.get("dps_reason") or "TTM dividends per share unavailable",
-        "eps_reason": "TTM EPS unavailable" + (f" ({src.get('shares_note') or 'no diluted share count'})" if not _num(src.get("avg_diluted_shares")) else " (net income missing)"),
+        "bvps": clean.get("bvps"), "cagr": clean.get("eps_cagr5"), "cagr_reason": _text(src, "eps_cagr5_reason"),
+        "price_reason": _text(src, "price_reason") or "price unavailable",
+        "mcap_reason": _text(src, "price_reason") or ("no shares outstanding available for market cap" if not _num(src.get("shares_out")) else "market cap unavailable"),
+        "ev_reason": _text(src, "ev_reason") or "EV unavailable", "tbv_reason": _text(src, "tbv_reason") or "TBV unavailable",
+        "dps_reason": _text(src, "dps_reason") or "TTM dividends per share unavailable",
+        "eps_reason": "TTM EPS unavailable" + (f" ({_text(src, 'shares_note') or 'no diluted share count'})" if not _num(src.get("avg_diluted_shares")) else " (net income missing)"),
         "revenue_reason": "TTM revenue unavailable", "gross_profit_reason": "TTM gross profit unavailable",
-        "equity_reason": "parent equity unavailable", "ocf_reason": "TTM operating cash flow unavailable", "fcf_reason": src.get("fcf_reason") or "TTM FCF unavailable",
-        "operating_income_reason": src.get("operating_income_reason") or "TTM operating income unavailable",
-        "ebitda_reason": src.get("ebitda_reason") or "TTM EBITDA unavailable",
+        "equity_reason": "parent equity unavailable", "ocf_reason": "TTM operating cash flow unavailable", "fcf_reason": _text(src, "fcf_reason") or "TTM FCF unavailable",
+        "operating_income_reason": _text(src, "operating_income_reason") or "TTM operating income unavailable",
+        "ebitda_reason": _text(src, "ebitda_reason") or "TTM EBITDA unavailable",
         "bvps_reason": "BVPS unavailable",
     }
 
@@ -853,7 +884,7 @@ def daily_table(review: Review) -> pd.DataFrame | None:
     days = pd.DataFrame({"date": close.index, "price": close.to_numpy(), "raw_close": prices.close_raw.reindex(close.index).to_numpy()})
     days = days[days["date"] >= rows["valuation_date"].min()]
     keep = [
-        "valuation_date", "quarter_end", "form", "accn", "held_row", "shares_out", "cash", "total_borrowings", "nci", "preferred", "equity", "tbv",
+        "valuation_date", "quarter_end", "form", "accn", "held_row", "currency_ok", "shares_out", "cash", "total_borrowings", "nci", "preferred", "equity", "tbv",
         "eps_ttm", "ttm_revenue", "ttm_gross_profit", "ttm_ocf", "ttm_fcf", "dps_ttm", "ttm_operating_income", "ttm_ebitda", "eps_cagr5",
     ] + [s.key for s in SERIES if s.key not in ("eps_ttm", "ttm_revenue", "ttm_gross_profit", "ttm_ocf", "ttm_fcf", "dps_ttm", "ttm_operating_income", "ttm_ebitda", "equity")]
     keep = list(dict.fromkeys(k for k in keep if k in rows))
@@ -865,6 +896,8 @@ def daily_table(review: Review) -> pd.DataFrame | None:
     merged["mcap"] = merged["price"] * num("shares_out")
     merged["ev"] = merged["mcap"] + num("total_borrowings").fillna(0) + num("nci").fillna(0) + num("preferred").fillna(0) - num("cash")
     uncertain = merged["date"].map(lambda d: bool(prices.uncertain_days.get(d, False)))
+    if "currency_ok" in merged:
+        uncertain = uncertain | ~merged["currency_ok"].fillna(True).astype(bool)  # no FX input: leave blank
     src = {
         "price": merged["price"], "mcap": merged["mcap"], "ev": merged["ev"], "eps": num("eps_ttm"), "revenue": num("ttm_revenue"),
         "gross_profit": num("ttm_gross_profit"), "equity": num("equity"), "tbv": num("tbv"), "ocf": num("ttm_ocf"), "fcf": num("ttm_fcf"),

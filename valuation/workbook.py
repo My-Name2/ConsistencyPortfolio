@@ -69,6 +69,11 @@ def _val(v):
     return v
 
 
+def _s(v) -> str:
+    """Text field from a DataFrame row; NaN and None become ''."""
+    return v if isinstance(v, str) else ""
+
+
 def _q(sheet: str) -> str:
     return f"'{sheet}'"
 
@@ -153,7 +158,7 @@ def _write_build(sh: Sheet, review) -> dict[tuple[int, str], int]:
             sh.put(r, 1, b["quarter_end"], "date")
             sh.put(r, 2, b["valuation_date"], "date")
             sh.put(r, 3, metric, font=BLACK)
-            sh.put(r, 4, b["method"] or "", font=BLACK)
+            sh.put(r, 4, _s(b["method"]), font=BLACK)
             for c, key in enumerate(["a", "b", "c", "d"], start=5):
                 if _num(b[key]):
                     sh.put(r, c, float(b[key]), unit)
@@ -170,9 +175,9 @@ def _write_build(sh: Sheet, review) -> dict[tuple[int, str], int]:
                 sh.put(r, 10, float(b["alt"]), unit)
                 sh.put(r, 11, f'=IF(AND(ISNUMBER(I{r}),ISNUMBER(J{r}),I{r}<>0),(I{r}-J{r})/ABS(I{r}),"")', "pct")
             for c, key in enumerate(["a_label", "b_label", "c_label", "d_label"], start=12):
-                sh.put(r, c, b[key] or "", font=BLACK)
-            sh.put(r, 16, b["sources"] or "", font=BLACK)
-            sh.put(r, 17, b["reason"] or "", font=BLACK)
+                sh.put(r, c, _s(b[key]), font=BLACK)
+            sh.put(r, 16, _s(b["sources"]), font=BLACK)
+            sh.put(r, 17, _s(b["reason"]), font=BLACK)
             r += 1
     ws.freeze_panes = "E4"
     return rows
@@ -217,12 +222,13 @@ def _write_valuation_inputs(sh: Sheet, review) -> tuple[dict[str, str], tuple[st
             elif key == "ev":
                 sh.put(r, j, f'=IF(AND(ISNUMBER({c["mcap"]}{r}),ISNUMBER({c["cash"]}{r})),{c["mcap"]}{r}+SUM({c["total_borrowings"]}{r},{c["nci"]}{r},{c["preferred"]}{r})-{c["cash"]}{r},"")', fmt)
             elif key == "debt_tags":
-                sh.put(r, j, "; ".join(t for t in (f"current: {row.get('debt_current_tag')}" if row.get("debt_current_tag") else "", f"noncurrent: {row.get('debt_noncurrent_tag')}" if row.get("debt_noncurrent_tag") else "", row.get("borrowings_note") or "") if t), font=BLACK)
+                cur, non, note = _s(row.get("debt_current_tag")), _s(row.get("debt_noncurrent_tag")), _s(row.get("borrowings_note"))
+                sh.put(r, j, "; ".join(t for t in (f"current: {cur}" if cur else "", f"noncurrent: {non}" if non else "", note) if t), font=BLACK)
             elif key == "vi_notes":
-                notes = [x for x in (row.get("tbv_reason"), row.get("ev_reason"), row.get("shares_source") if "fallback" in str(row.get("shares_source")) else "") if x]
+                notes = [x for x in (_s(row.get("tbv_reason")), _s(row.get("ev_reason")), _s(row.get("shares_source")) if "fallback" in _s(row.get("shares_source")) else "") if x]
                 sh.put(r, j, "; ".join(notes), font=BLACK)
             elif key in ("form", "accn", "price_reason", "cover_accn", "bs_accn"):
-                sh.put(r, j, row.get(key) or "", font=BLACK)
+                sh.put(r, j, _s(row.get(key)), font=BLACK)
             else:
                 v = row.get(key)
                 sh.put(r, j, v if (_num(v) or isinstance(v, pd.Timestamp)) else None, fmt)
@@ -320,8 +326,8 @@ def _write_ttm_quarterly(sh: Sheet, review, build_rows, vi, div_cols) -> dict[st
             b = int(base) + 2
             e = c["eps_ttm"]
             sh.put(r, ws[f"{c['eps_cagr5']}1"].column, f'=IF(AND(ISNUMBER({e}{r}),ISNUMBER({e}{b})),IF(AND({e}{r}>0,{e}{b}>0),({e}{r}/{e}{b})^(1/5)-1,""),"")', "pct")
-        sh.put(r, ws[f"{c['shares_method']}1"].column, row.get("shares_method") or "", font=BLACK)
-        sh.put(r, ws[f"{c['notes']}1"].column, row.get("notes") or "", font=BLACK)
+        sh.put(r, ws[f"{c['shares_method']}1"].column, _s(row.get("shares_method")), font=BLACK)
+        sh.put(r, ws[f"{c['notes']}1"].column, _s(row.get("notes")), font=BLACK)
     ws.freeze_panes = "H2"
     return cols
 

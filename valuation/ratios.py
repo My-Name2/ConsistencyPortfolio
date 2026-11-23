@@ -73,7 +73,7 @@ def compute(ratio: RatioDef, inputs: dict) -> tuple[object, str]:
         return num / (cagr * 100.0), ""
     if not _num(num) or not _num(den):
         missing = [name for name, value in ((ratio.numerator, num), (ratio.denominator, den)) if not _num(value)]
-        reasons = [inputs.get(f"{m}_reason") or f"{m} missing" for m in missing]
+        reasons = [str(inputs.get(f"{m}_reason")) if isinstance(inputs.get(f"{m}_reason"), str) and inputs.get(f"{m}_reason") else f"{m} missing" for m in missing]
         return None, "; ".join(reasons)
     if den <= 0:
         return NM, f"{ratio.denominator} is zero or negative"

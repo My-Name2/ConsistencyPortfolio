@@ -67,7 +67,7 @@ class FiscalYear:
 class Quarter:
     fy: int
     k: int
-    start: pd.Timestamp
+    start: pd.Timestamp | None  # None when the preceding quarter end is unknown (e.g. annual-only 20-F reporting)
     end: pd.Timestamp
 
     @property
@@ -176,13 +176,16 @@ def build_calendar(tables: list[MetricTable], dq: DQLog, as_of: pd.Timestamp) ->
 
     quarters: list[Quarter] = []
     for fy in years:
-        prior_end = fy.start - pd.Timedelta(days=1)
         for k in (1, 2, 3, 4):
             if k not in fy.quarter_ends:
-                break  # a missing quarter end breaks the chain inside this fiscal year
-            q_end = fy.quarter_ends[k]
-            quarters.append(Quarter(fy.index, k, prior_end + pd.Timedelta(days=1), q_end))
-            prior_end = q_end
+                continue  # a missing quarter end breaks quarter chains; the fiscal-year end still stands on its own
+            if k == 1:
+                q_start = fy.start
+            elif (k - 1) in fy.quarter_ends:
+                q_start = fy.quarter_ends[k - 1] + pd.Timedelta(days=1)
+            else:
+                q_start = None
+            quarters.append(Quarter(fy.index, k, q_start, fy.quarter_ends[k]))
 
     _log_calendar(years, periods, dq)
     return Calendar(years, quarters)
@@ -235,7 +238,7 @@ def quarterly_values(metric: MetricTable, cal: Calendar, dq: DQLog) -> pd.DataFr
     additive = metric.metric.additive
     for q in cal.quarters:
         fy = cal.years[q.fy]
-        reported = metric.get(q.start, q.end)
+        reported = metric.get(q.start, q.end) if q.start is not None else None
         if reported is not None and not (classify_days(reported["days"]) == "quarter" or (q.k == 1 and classify_days(reported["days"]) == "long_quarter")):
             reported = None
         ytd = metric.get(fy.start, q.end)
