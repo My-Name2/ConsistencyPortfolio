@@ -37,6 +37,10 @@ EPS_CHECK_TOL = 0.05
 THIN_MIN_YEARS = 3
 THIN_MIN_TTM = 8
 COVER_CLASS_RATIO = 0.85  # cover-page shares below this share of weighted basic shares cover one class only
+# Opt-in (off by default): replace total OCF by continuing-operations OCF wherever both are tagged (or total -
+# discontinued). Measured on 486 tickers it fixes some series (BDX, DLTR, HUBB, SLB) but per-period substitution
+# mixes the two definitions for more filers than it repairs, so the default keeps the total.
+PREFER_CONTINUING_OCF = False
 
 
 @dataclass
@@ -360,7 +364,8 @@ def run_review(inp: ReviewInputs) -> Review:
     tables["equity"] = parent_equity(tables["equity"], tables["nci"], dq)
     capex_parts = {tag: build_metric_table(cf, MetricDef(f"capex:{tag}", tag, "duration", "money", True, {US: (tag,)}, {}), basis, DQLog()) for tag in CAPEX_COMPONENT_TAGS}
     tables["capex"] = capex_components(tables["capex"], {k: v for k, v in capex_parts.items() if not v.table.empty}, dq)
-    tables["ocf"] = continuing_operations_ocf(tables["ocf"], tables["ocf_continuing"], dq, tables["ocf_discontinued"])
+    if PREFER_CONTINUING_OCF:
+        tables["ocf"] = continuing_operations_ocf(tables["ocf"], tables["ocf_continuing"], dq, tables["ocf_discontinued"])
     debt = {slot: build_metric_table(cf, _slot_metric(slot, {US: DEBT_TAGS[US][slot], IFRS: DEBT_TAGS[IFRS][slot]}), basis, DQLog()) for slot in DEBT_TAGS[US]}
 
     currencies = sorted(set(cf.filings["dominant_currency"].dropna()))
