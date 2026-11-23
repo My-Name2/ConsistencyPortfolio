@@ -446,3 +446,25 @@ def test_total_ocf_kept_by_default():
 
     r = _review_with(mutate)
     assert row_for(r, "2023-12-31")["ttm_ocf"] == pytest.approx(sum(fixture.ocf(2023, k) for k in (1, 2, 3, 4)))
+
+
+def test_reference_window_counts_and_conventions(review):
+    from valuation.reference import ReferenceOptions, review_counts, window_counts
+
+    assert window_counts([1, 2, None, 3, 2, 4], 6) == {"#Obs": 5, "#Inc": 2, "#Rec": 3, "#Inc Adj": 2, "#Rec Adj": 3}  # 2, 3, 4 are new highs
+    assert window_counts([1, 2, None, 3, 2, 4], 6, record_counts_first=True)["#Rec"] == 4
+    spec = review_counts(review, ReferenceOptions(window=8))
+    emulated = review_counts(review, ReferenceOptions(window=8, emulate_first_ytd=True))
+    assert spec["CFO"]["#Obs"] == emulated["CFO"]["#Obs"] == 8
+    # The emulated first value includes the prior YTD, so it can only suppress later increases and records.
+    assert emulated["CFO"]["#Rec"] <= spec["CFO"]["#Rec"]
+
+
+def test_single_cell_is_in_sync_with_the_package():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("build_single_cell", Path(__file__).resolve().parents[1] / "tools" / "build_single_cell.py")
+    builder = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(builder)
+    committed = (Path(__file__).resolve().parents[1] / "valuation_single_cell.py").read_text(encoding="utf-8")
+    assert builder.build() == committed, "run: python -B tools/build_single_cell.py"
