@@ -32,11 +32,19 @@ class ReferenceOptions:
     missing_capex_as_zero: bool = False  # reference fills FCF = CFO where capex is missing
     align_window: bool = False  # end the window at the quarter the reference's latest TTM totals match (drops our newer quarters)
     eps_counts_net_income: bool = False  # the reference's "EPS TTM" counts are computed on TTM net income, not per-share EPS
+    # Equity (EQ). The reference counts the balance-sheet value at each of the last 60 fiscal quarter ends; its
+    # "EQ TTM" fingerprint is the 4-quarter mean of those values over 57 observations (the same 60 quarter ends).
+    equity_quarter_ends: bool = False  # EQ = equity at every fiscal quarter end (also quarters before our first TTM row), not at valuation dates
+    equity_total: bool = False  # EQ includes noncontrolling interest (total equity), not parent equity only
+    equity_first_reported: bool = False  # EQ uses each quarter end's value as first reported, not as later restated
+    equity_fingerprint_mean4: bool = False  # compare EQ's fingerprint as the 4-quarter mean over `window` observations
+    equity_history_years: int = 0  # with equity_quarter_ends: only quarter ends within this many years before the as-of date (0 = no limit)
 
     @classmethod
     def reference_compatible(cls) -> "ReferenceOptions":
         return cls(window=57, equity_window=60, record_counts_first=True, emulate_first_ytd=True, missing_capex_as_zero=True, align_window=True,
-                   eps_counts_net_income=True)
+                   eps_counts_net_income=True, equity_quarter_ends=True, equity_total=True, equity_first_reported=True, equity_fingerprint_mean4=True,
+                   equity_history_years=15)
 
 
 def _num(v) -> bool:
@@ -183,7 +191,38 @@ def series_eps(review, ttm: pd.DataFrame, options: ReferenceOptions) -> list:
     return list(pd.to_numeric(ttm[column], errors="coerce"))
 
 
+def quarter_end_equity(review, last_quarter_end, total: bool = False, first_reported: bool = False, since=None) -> list:
+    """Equity at every fiscal quarter end from `since` to `last_quarter_end` (None where no balance sheet is tagged at that instant).
+
+    `total` adds noncontrolling interest back (total equity); `first_reported` takes each instant's value from the
+    first filing that reported it (a 10-Q or 10-K balance sheet), as the reference does, instead of later restatements.
+    """
+    last = pd.Timestamp(last_quarter_end)
+    first = pd.Timestamp(since) if since is not None else pd.Timestamp.min
+    ends = sorted({q.end for q in review.calendar.quarters if first <= q.end <= last})
+    equity, nci = review.tables["equity"], review.tables.get("nci")
+    column = "first_value" if first_reported else "value"
+    out = []
+    for end in ends:
+        row = equity.get(None, end)
+        if row is None or not _num(float(row[column])):
+            out.append(None)
+            continue
+        value = float(row[column])
+        n = nci.get(None, end) if total and nci is not None else None
+        if n is not None:
+            # Rows derived as total - NCI subtracted NCI's latest value; add that back to recover the tagged total.
+            value += float(n["value"] if str(row["tag"]).startswith("derived:") else n[column])
+        out.append(value)
+    return out
+
+
 def series_eq(review, ttm: pd.DataFrame, options: ReferenceOptions) -> list:
+    if options.equity_quarter_ends:
+        # The reference's quarterly history starts 15 years before its as-of date: off-calendar filers whose 60th
+        # quarter back ends before then (ACN 2011-08-31 for an as-of of 2026-09-14) have 59 observations there.
+        since = pd.Timestamp(review.inputs.as_of) - pd.DateOffset(years=options.equity_history_years) if options.equity_history_years else None
+        return quarter_end_equity(review, ttm["quarter_end"].iloc[-1], options.equity_total, options.equity_first_reported, since)
     return list(pd.to_numeric(ttm["equity"], errors="coerce"))
 
 
@@ -208,7 +247,11 @@ def review_counts(review, options: ReferenceOptions | None = None, reference_row
         values = series_for(review, metric, options, offset)
         counts = window_counts(values, window, options.record_counts_first)
         counts["offset"] = offset
-        counts["fingerprint"] = fingerprint(values, window, metric, money=metric in MONEY_METRICS or (metric == "EPS" and options.eps_counts_net_income))
+        money = metric in MONEY_METRICS or (metric == "EPS" and options.eps_counts_net_income)
+        if metric == "EQ" and options.equity_fingerprint_mean4:
+            counts["fingerprint"] = fingerprint(list(pd.Series(values, dtype=float).rolling(4).mean()), options.window, metric, money=money)
+        else:
+            counts["fingerprint"] = fingerprint(values, window, metric, money=money)
         out[metric] = counts
     return out
 

@@ -460,6 +460,40 @@ def test_reference_window_counts_and_conventions(review):
     assert emulated["CFO"]["#Rec"] <= spec["CFO"]["#Rec"]
 
 
+def test_reference_equity_quarter_ends_total_and_first_reported():
+    from valuation.reference import ReferenceOptions, quarter_end_equity, review_counts
+
+    def mutate(f):
+        eq = f["us-gaap"]["StockholdersEquity"]["units"]["USD"]
+        later = next(i for i in eq if i["end"] == "2025-03-31")
+        restated = next(i for i in eq if i["end"] == "2024-12-31")
+        # The Q1-2025 10-Q restates year-end equity; a noncontrolling interest is tagged at 2025-06-30.
+        eq.append(dict(restated, val=restated["val"] + 500.0, accn=later["accn"], filed=later["filed"], form=later["form"], fy=later["fy"], fp=later["fp"]))
+        q2 = next(i for i in eq if i["end"] == "2025-06-30")
+        f["us-gaap"]["MinorityInterest"] = {"label": "NCI", "units": {"USD": [dict(q2, val=7_000.0)]}}
+
+    r = _review_with(mutate)
+    last = r.ttm["quarter_end"].iloc[-1]
+    restated = quarter_end_equity(r, last)
+    first = quarter_end_equity(r, last, first_reported=True)
+    total = quarter_end_equity(r, last, total=True, first_reported=True)
+    # Every fiscal quarter end 2019 Q1 - 2025 Q3 (also quarters without a TTM row in filers with longer histories).
+    assert len(restated) == 27
+    assert restated[0] == 3_000_000.0 + 10_000.0 * fixture.q_index(2019, 1)
+    i = 23  # 2024-12-31
+    assert restated[i] == first[i] + 500.0 == 3_000_000.0 + 10_000.0 * fixture.q_index(2024, 4) + 500.0
+    assert total[-2] == first[-2] + 7_000.0 and total[-1] == first[-1]
+    spec = review_counts(r, ReferenceOptions(window=57, equity_window=60))
+    ref = review_counts(r, ReferenceOptions(window=57, equity_window=60, equity_quarter_ends=True, equity_total=True, equity_first_reported=True, equity_fingerprint_mean4=True))
+    assert spec["EQ"]["#Obs"] == r.ttm["equity"].notna().sum() and ref["EQ"]["#Obs"] == 27
+    # The fingerprint is taken over the 4-quarter means (24 of them for 27 quarter ends).
+    assert ref["EQ"]["fingerprint"]["last"] == pytest.approx(sum(total[-4:]) / 4 / 1e6)
+    # A history limit counts only quarter ends within that many years of the as-of date (2025-11-21 - 2y).
+    assert len(quarter_end_equity(r, last, since=pd.Timestamp("2023-11-21"))) == 8  # 2023 Q4 - 2025 Q3
+    limited = review_counts(r, ReferenceOptions(window=57, equity_window=60, equity_quarter_ends=True, equity_history_years=2))
+    assert limited["EQ"]["#Obs"] == 8
+
+
 def test_single_cell_is_in_sync_with_the_package():
     import importlib.util
 
