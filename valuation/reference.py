@@ -45,8 +45,9 @@ class ReferenceOptions:
     # counts), plus the quarters the reference holds beyond ours when its latest totals match none of our last rows;
     # the window is that many of our latest rows. See dated_window().
     window_by_date: bool = False
-    # Alignment by the reference's own fingerprints: among windows ending 0, 1 or 2 rows before our latest, take the
-    # one whose slope/R2 match the reference on more metrics than the value-based offset does.
+    # DIAGNOSTIC ONLY (never in reference_compatible()): alignment by the reference's own fingerprints. Among windows
+    # ending 0, 1 or 2 rows before our latest, take the one whose slope/R2 match the reference on more metrics than
+    # the value-based offset does. It picks the window with the answer it is scored against, so report it separately.
     align_by_fingerprint: bool = False
     eps_counts_net_income: bool = False  # the reference's "EPS TTM" counts are computed on TTM net income, not per-share EPS
     # Equity (EQ). The reference counts the balance-sheet value at each of the last 60 fiscal quarter ends; its
