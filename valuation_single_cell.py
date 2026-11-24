@@ -4794,7 +4794,7 @@ import pandas as pd
 
 METRIC_COLUMNS = {"Rev": "ttm_revenue", "EPS": "eps_ttm", "FCF": "ttm_fcf", "GP": "ttm_gross_profit", "CFO": "ttm_ocf", "EQ": "equity"}
 FIELDS = ["#Obs", "#Inc", "#Rec", "#Inc Adj", "#Rec Adj"]
-MONEY_METRICS = {"Rev", "FCF", "GP", "CFO", "EQ"}  # reference fingerprints are in $ millions
+MONEY_METRICS = {"Rev", "FCF", "GP", "CFO", "EQ"}  # reference fingerprints are in $ millions (EPS too when it counts net income)
 ALIGN_COLUMNS = {"ttm_revenue": "Revenue TTM Total", "ttm_ocf": "CFO TTM Total", "ttm_net_income": "Net Income TTM Total"}
 
 
@@ -4806,10 +4806,12 @@ class ReferenceOptions:
     emulate_first_ytd: bool = False  # reference artifact: the first window value of YTD-built series (CFO, FCF) includes the prior YTD
     missing_capex_as_zero: bool = False  # reference fills FCF = CFO where capex is missing
     align_window: bool = False  # end the window at the quarter the reference's latest TTM totals match (drops our newer quarters)
+    eps_counts_net_income: bool = False  # the reference's "EPS TTM" counts are computed on TTM net income, not per-share EPS
 
     @classmethod
     def reference_compatible(cls) -> "ReferenceOptions":
-        return cls(window=57, equity_window=60, record_counts_first=True, emulate_first_ytd=True, missing_capex_as_zero=True, align_window=True)
+        return cls(window=57, equity_window=60, record_counts_first=True, emulate_first_ytd=True, missing_capex_as_zero=True, align_window=True,
+                   eps_counts_net_income=True)
 
 
 def _num(v) -> bool:
@@ -4844,10 +4846,10 @@ def window_counts(values: list, window: int, record_counts_first: bool = False) 
     }
 
 
-def fingerprint(values: list, window: int, metric: str) -> dict:
+def fingerprint(values: list, window: int, metric: str, money: bool | None = None) -> dict:
     """Slope (per observation), R2 and CV% (population sd) of the window's values, as the reference computes them."""
     vals = [float(v) for v in values[-window:] if _num(v)]
-    if metric in MONEY_METRICS:
+    if (metric in MONEY_METRICS) if money is None else money:
         vals = [v / 1e6 for v in vals]
     if len(vals) < 3:
         return {"slope": np.nan, "r2": np.nan, "cv": np.nan, "last": vals[-1] if vals else np.nan}
@@ -4950,7 +4952,10 @@ def series_fcf(review, ttm: pd.DataFrame, options: ReferenceOptions) -> list:
 
 
 def series_eps(review, ttm: pd.DataFrame, options: ReferenceOptions) -> list:
-    return list(pd.to_numeric(ttm["eps_ttm"], errors="coerce"))
+    # The reference's "EPS TTM" fingerprint (slope, R2, CV%) equals TTM net income's in $ millions
+    # (AAPL 1520.44 / 0.8742 / 38.86%, MSFT 1872.63 / 0.8564 / 68.94%), so its counts use net income.
+    column = "ttm_net_income" if options.eps_counts_net_income else "eps_ttm"
+    return list(pd.to_numeric(ttm[column], errors="coerce"))
 
 
 def series_eq(review, ttm: pd.DataFrame, options: ReferenceOptions) -> list:
@@ -4978,7 +4983,7 @@ def review_counts(review, options: ReferenceOptions | None = None, reference_row
         values = series_for(review, metric, options, offset)
         counts = window_counts(values, window, options.record_counts_first)
         counts["offset"] = offset
-        counts["fingerprint"] = fingerprint(values, window, metric)
+        counts["fingerprint"] = fingerprint(values, window, metric, money=metric in MONEY_METRICS or (metric == "EPS" and options.eps_counts_net_income))
         out[metric] = counts
     return out
 
