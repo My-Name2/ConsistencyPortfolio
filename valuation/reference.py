@@ -35,6 +35,12 @@ BANK_INTEREST_INCOME_TAGS = ("InterestAndDividendIncomeOperating", "InterestInco
 BANK_INTEREST_EXPENSE_TAGS = ("InterestExpense", "InterestExpenseOperating")
 BANK_NET_INTEREST_TAGS = ("InterestIncomeExpenseNet",)
 BANK_NONINTEREST_TAGS = ("NoninterestIncome",)
+# Lines that Zacks treats as cost of sales for filers without a cost-of-revenue line (insurance benefits and losses,
+# utility fuel / purchased power / regulated operations, property operating costs) or that are cost-of-revenue components.
+COST_LINE_PATTERN = (r"^(CostOf.*|.*CostOfGoods.*|.*CostOfServices.*|.*CostOfRevenue.*|GrossProfit|PolicyholderBenefits.*|BenefitsLossesAndExpenses|"
+                     r".*Premiums.*Earned.*|.*LossAndLossAdjustmentExpense.*|.*PolicyholderFunds.*|.*FuelCosts.*|.*PurchasedPower.*|Regulated.*Revenue.*|"
+                     r"UtilitiesOperatingExpense.*|ElectricUtilityRevenue|.*PublicUtilit.*|RealEstateRevenueNet|OperatingLeasesIncomeStatementLeaseRevenue|"
+                     r"DirectCostsOfLeasedAndRentedPropertyOrEquipment|.*RealEstate.*Expense.*|OperatingLeaseLeaseIncome)$")
 
 
 @dataclass
@@ -72,14 +78,14 @@ class ReferenceOptions:
     rev_bank_gross: bool = False  # banks (noninterest income + interest income tagged): Rev = interest income + noninterest income (gross), not net of interest expense
     rev_fill_tags: tuple = ()  # fill blank TTM revenue from these single-line total-revenue tags (first available per period)
     gp_bank_net: bool = False  # banks: GP = revenue net of interest expense (net interest income + noninterest income)
-    gp_revenue_when_gm100: bool = False  # where the reference's GM % is 100 (financials without a cost of revenue), GP = Rev
+    gp_revenue_without_cost_lines: bool = False  # GP = Rev for non-bank filers that tag no gross profit, cost of revenue, insurance, utility or property cost line (Zacks: GM 100%)
 
     @classmethod
     def reference_compatible(cls) -> "ReferenceOptions":
         return cls(window=57, equity_window=60, record_counts_first=True, emulate_first_ytd=True, missing_capex_as_zero=True, align_window=True,
                    eps_counts_net_income=True, eps_net_income="common", equity_quarter_ends=True, equity_total=True, equity_first_reported=True,
                    equity_fingerprint_mean4=True, equity_history_years=15, window_by_date=True, comparative_depth=dict(COMPARATIVE_DEPTH),
-                   rev_bank_gross=True, rev_fill_tags=REV_FILL_TAGS, gp_bank_net=True, gp_revenue_when_gm100=True)
+                   rev_bank_gross=True, rev_fill_tags=REV_FILL_TAGS, gp_bank_net=True, gp_revenue_without_cost_lines=True)
 
 
 def _num(v) -> bool:
@@ -248,6 +254,19 @@ def _bank_series(review, ttm: pd.DataFrame) -> tuple[np.ndarray, np.ndarray] | N
     return gross, net
 
 
+def _tags_cost_lines(review, ttm: pd.DataFrame, window: int) -> bool:
+    """Whether the filer tags any COST_LINE_PATTERN line (us-gaap duration fact) ending within the window."""
+    import re
+
+    ends = pd.to_datetime(ttm["quarter_end"]).tail(window)
+    if ends.empty:
+        return False
+    f = review.cf.facts
+    recent = f[(f["taxonomy"] == "us-gaap") & (f["kind"] == "duration") & (f["end"] > ends.iloc[0] - pd.DateOffset(years=1)) & (f["end"] <= ends.iloc[-1])]
+    pattern = re.compile(COST_LINE_PATTERN)
+    return any(pattern.match(tag) for tag in recent["tag"].unique())
+
+
 def series_rev(review, ttm: pd.DataFrame, options: ReferenceOptions) -> list:
     values = pd.to_numeric(ttm["ttm_revenue"], errors="coerce").to_numpy(dtype=float)
     if options.rev_fill_tags and np.isnan(values).any():
@@ -261,13 +280,13 @@ def series_rev(review, ttm: pd.DataFrame, options: ReferenceOptions) -> list:
 
 def series_gp(review, ttm: pd.DataFrame, options: ReferenceOptions) -> list:
     values = pd.to_numeric(ttm["ttm_gross_profit"], errors="coerce").to_numpy(dtype=float)
-    gm = getattr(review, "_reference_gm", None)
-    if options.gp_revenue_when_gm100 and gm is not None and _num(gm) and abs(float(gm) - 100) < 1e-6:
-        return series_rev(review, ttm, options)
     if options.gp_bank_net:
         bank = _bank_series(review, ttm)
         if bank is not None:
             return list(bank[1])
+    if (options.gp_revenue_without_cost_lines and not np.isfinite(values[-options.window:]).any()
+            and not _tags_cost_lines(review, ttm, options.window)):
+        return series_rev(review, ttm, options)
     return list(values)
 
 
@@ -452,8 +471,6 @@ def fingerprint_matches(counts: dict[str, dict], reference_row: pd.Series | None
 def review_counts(review, options: ReferenceOptions | None = None, reference_row: pd.Series | None = None) -> dict[str, dict]:
     options = options or ReferenceOptions()
     offset = alignment_offset(review, reference_row) if options.align_window else 0
-    if reference_row is not None:  # the reference's latest gross margin, read by series_gp (gp_revenue_when_gm100)
-        review.__dict__["_reference_gm"] = pd.to_numeric(str(reference_row.get("GM %", "")).replace(",", "").replace("%", ""), errors="coerce")
     out = _counts_at(review, options, offset, reference_row)
     if options.align_by_fingerprint and reference_row is not None:
         best = fingerprint_matches(out, reference_row)

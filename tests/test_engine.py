@@ -532,17 +532,17 @@ def test_reference_bank_revenue_gross_and_gross_profit_net():
     assert series_rev(plain, plain.ttm.reset_index(drop=True), compat) == pytest.approx(list(plain.ttm["ttm_revenue"]), nan_ok=True)  # not a bank
 
 
-def test_reference_gross_profit_is_revenue_where_the_reference_margin_is_100():
-    from types import SimpleNamespace
-
+def test_reference_gross_profit_is_revenue_without_cost_lines():
     from valuation.reference import ReferenceOptions, series_gp
 
-    ttm = pd.DataFrame({"quarter_end": pd.to_datetime(["2024-03-31", "2024-06-30"]), "ttm_revenue": [100.0, 110.0], "ttm_gross_profit": [float("nan")] * 2})
-    stub = SimpleNamespace(_reference_gm=100.0)
-    assert all(pd.isna(series_gp(stub, ttm, ReferenceOptions())))  # spec: blank stays blank
-    assert series_gp(stub, ttm, ReferenceOptions(gp_revenue_when_gm100=True)) == [100.0, 110.0]
-    stub._reference_gm = 42.0
-    assert all(pd.isna(series_gp(stub, ttm, ReferenceOptions(gp_revenue_when_gm100=True))))
+    option = ReferenceOptions(gp_revenue_without_cost_lines=True)
+    plain = _review_with(lambda f: None)  # the fixture tags no gross profit and no cost line (an asset-manager-like filer)
+    ttm = plain.ttm.reset_index(drop=True)
+    assert all(pd.isna(series_gp(plain, ttm, ReferenceOptions())))  # spec: blank stays blank
+    assert series_gp(plain, ttm, option) == pytest.approx(list(ttm["ttm_revenue"]), nan_ok=True)
+    # An insurer (benefits and losses tagged) keeps a blank gross profit: Zacks deducts its benefits.
+    insurer = _review_with(lambda f: _cost_facts(f, "PolicyholderBenefitsAndClaimsIncurredNet", 0.6))
+    assert all(pd.isna(series_gp(insurer, insurer.ttm.reset_index(drop=True), option)))
 
 
 def test_single_cell_is_in_sync_with_the_package():
