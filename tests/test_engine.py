@@ -545,6 +545,32 @@ def test_reference_gross_profit_is_revenue_without_cost_lines():
     assert all(pd.isna(series_gp(insurer, insurer.ttm.reset_index(drop=True), option)))
 
 
+def test_reference_fcf_net_capex_and_capitalized_software():
+    from valuation.reference import ReferenceOptions, series_for
+
+    capex_tag = "PaymentsToAcquirePropertyPlantAndEquipment"
+
+    def mutate(f):  # PP&E sale proceeds = 10% and capitalized software = 5% of capex in every capex period
+        items = f["us-gaap"][capex_tag]["units"]["USD"]
+        f["us-gaap"]["ProceedsFromSaleOfPropertyPlantAndEquipment"] = {"label": "p", "units": {"USD": [dict(i, val=i["val"] * 0.10) for i in items]}}
+        f["us-gaap"]["PaymentsToDevelopSoftware"] = {"label": "s", "units": {"USD": [dict(i, val=i["val"] * 0.05) for i in items]}}
+        f["us-gaap"]["PaymentsToAcquireSoftware"] = {"label": "x", "units": {"USD": [dict(i, val=i["val"] * 0.50) for i in items]}}  # purchased software: never added
+
+    r = _review_with(mutate)
+    ocf, capex = (pd.to_numeric(r.ttm[c], errors="coerce").reset_index(drop=True) for c in ("ttm_ocf", "ttm_capex"))
+    gross = series_for(r, "FCF", ReferenceOptions())
+    net = series_for(r, "FCF", ReferenceOptions(fcf_net_capex=True))
+    both = series_for(r, "FCF", ReferenceOptions(fcf_net_capex=True, fcf_capex_software=True))
+    rows = [i for i in range(len(ocf)) if pd.notna(ocf[i]) and pd.notna(capex[i])]
+    assert rows
+    for i in rows:
+        assert gross[i] == pytest.approx(ocf[i] - capex[i])
+        assert net[i] == pytest.approx(ocf[i] - 0.90 * capex[i])
+        assert both[i] == pytest.approx(ocf[i] - 0.95 * capex[i])
+    o = ReferenceOptions.reference_compatible()
+    assert o.fcf_net_capex and o.fcf_capex_software
+
+
 def test_single_cell_is_in_sync_with_the_package():
     import importlib.util
 
