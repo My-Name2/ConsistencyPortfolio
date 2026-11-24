@@ -498,9 +498,9 @@ def test_reference_eps_counts_net_income_available_to_common():
 
     common = "NetIncomeLossAvailableToCommonStockholdersBasic"
 
-    def mutate(f):
-        items = [dict(i, val=i["val"] - 1_000.0 * (4 if (pd.Timestamp(i["end"]) - pd.Timestamp(i["start"])).days > 300 else 1))
-                 for i in f["us-gaap"]["NetIncomeLoss"]["units"]["USD"] if (pd.Timestamp(i["end"]) - pd.Timestamp(i["start"])).days < 100 or (pd.Timestamp(i["end"]) - pd.Timestamp(i["start"])).days > 300]
+    def mutate(f):  # 1,000 of preferred dividends per quarter in every NI period (quarters, YTDs, years)
+        quarters = lambda i: round((pd.Timestamp(i["end"]) - pd.Timestamp(i["start"])).days / 91.3)  # noqa: E731
+        items = [dict(i, val=i["val"] - 1_000.0 * quarters(i)) for i in f["us-gaap"]["NetIncomeLoss"]["units"]["USD"]]
         f["us-gaap"][common] = {"label": common, "units": {"USD": items}}
 
     r = _review_with(mutate)

@@ -185,33 +185,36 @@ def series_fcf(review, ttm: pd.DataFrame, options: ReferenceOptions) -> list:
     return values
 
 
-# Net income available to common stockholders (after preferred dividends and participating-security
-# allocations), falling back per period to NI attributable to parent, then ProfitLoss less NCI income.
-NI_COMMON_CANDIDATES = {
-    "us-gaap": ("NetIncomeLossAvailableToCommonStockholdersBasic", "NetIncomeLoss", "ProfitLoss"),
-    "ifrs-full": ("ProfitLossAttributableToOwnersOfParent", "ProfitLoss"),
-}
+NI_COMMON_TAG = "NetIncomeLossAvailableToCommonStockholdersBasic"
 
 
-def _ttm_from_tags(review, ttm: pd.DataFrame, key: str, candidates: dict) -> list:
-    """TTM sums of a flow built from `candidates` (taxonomy -> tags in priority order), one per TTM row,
-    with the review's own period rules (YTD differencing, FY - 9M, NCI subtracted from ProfitLoss)."""
+def _ni_available_to_common(review, ttm: pd.DataFrame) -> list:
+    """TTM net income available to common stockholders: the review's TTM NI attributable to parent less the TTM
+    of (NI - NI available to common), the latter taken only from periods where both are tagged and built with the
+    review's period rules (YTD differencing, FY - 9M). Where that TTM difference cannot be built, NI is used as is,
+    so tagging gaps never mix the two tags inside one quarter."""
     from .dq import DQLog
     from .periods import quarterly_values, ttm_flow
-    from .tags import MetricDef
-    from .values import build_metric_table, parent_share_of_profit_loss
+    from .tags import IFRS, US, MetricDef
+    from .values import MetricTable, build_metric_table
 
-    table = build_metric_table(review.cf, MetricDef(key, key, "duration", "money", True, dict(candidates)), review.basis, DQLog())
-    if table.table.empty:
-        return [None] * len(ttm)
-    table = parent_share_of_profit_loss(table, review.tables["nci_income"], DQLog())
+    base = list(pd.to_numeric(ttm["ttm_net_income"], errors="coerce"))
+    ni = review.tables["net_income"]
+    common = build_metric_table(review.cf, MetricDef("ni_common", "NI available to common", "duration", "money", True, {US: (NI_COMMON_TAG,), IFRS: ()}), review.basis, DQLog())
+    if ni.table.empty or common.table.empty:
+        return base
+    both = ni.table.merge(common.table[["start", "end", "value"]], on=["start", "end"], suffixes=("", "_common"))
+    if both.empty:
+        return base
+    diff = MetricTable(ni.metric, both.assign(value=both["value"].astype(float) - both["value_common"].astype(float)).drop(columns="value_common"))
     cal = review.calendar
-    qv = quarterly_values(table, cal, DQLog())
+    qv = quarterly_values(diff, cal, DQLog())
     by_end = {q.end: q for q in cal.quarters}
     out = []
-    for end in ttm["quarter_end"]:
+    for end, value in zip(ttm["quarter_end"], base):
         q = by_end.get(pd.Timestamp(end))
-        out.append(None if q is None else ttm_flow(table, qv, cal, q).value)
+        d = ttm_flow(diff, qv, cal, q).value if q is not None and _num(value) else None
+        out.append(value - d if _num(value) and _num(d) else value)
     return out
 
 
@@ -223,7 +226,7 @@ def series_eps(review, ttm: pd.DataFrame, options: ReferenceOptions) -> list:
     if options.eps_net_income == "common":
         # Its net income is after preferred dividends: JPM 778.82 / 0.8662 (ours with NI to parent 780.43 / 0.8705);
         # latest "Net Income TTM Total" 63,634 = NI available to common (NI attributable to parent 65,067).
-        return _ttm_from_tags(review, ttm, "net_income_common", NI_COMMON_CANDIDATES)
+        return _ni_available_to_common(review, ttm)
     return list(pd.to_numeric(ttm["ttm_net_income"], errors="coerce"))
 
 
