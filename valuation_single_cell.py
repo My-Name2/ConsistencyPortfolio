@@ -5145,6 +5145,10 @@ class ReferenceOptions:
     equity_first_reported: bool = False  # EQ uses each quarter end's value as first reported, not as later restated
     equity_fingerprint_mean4: bool = False  # compare EQ's fingerprint as the 4-quarter mean over `window` observations
     equity_history_years: int = 0  # with equity_quarter_ends: only quarter ends after the as-of month's start this many years earlier (0 = no limit)
+    # FCF. The reference's capex is net capex (Zacks): PP&E purchases less PP&E sale proceeds, plus capitalized
+    # internal-use software where that is a separate cash-flow line (not purchased software).
+    fcf_net_capex: bool = False  # FCF capex = purchases - PP&E sale proceeds (PPE_PROCEEDS_TAGS), not purchases only
+    fcf_capex_software: bool = False  # FCF capex adds capitalized software (CAPITALIZED_SOFTWARE_TAGS)
     eps_net_income: str = "parent"  # with eps_counts_net_income: "parent" (the review's NI attributable to parent) or "common" (NI available to common stockholders)
     # Revenue (Rev) and gross profit (GP).
     rev_bank_gross: bool = False  # banks (noninterest income + interest income tagged): Rev = interest income + noninterest income (gross), not net of interest expense
@@ -5157,7 +5161,8 @@ class ReferenceOptions:
         return cls(window=57, equity_window=60, record_counts_first=True, emulate_first_ytd=True, missing_capex_as_zero=True, align_window=True,
                    eps_counts_net_income=True, eps_net_income="common", equity_quarter_ends=True, equity_total=True, equity_first_reported=True,
                    equity_fingerprint_mean4=True, equity_history_years=15, window_by_date=True, comparative_depth=dict(COMPARATIVE_DEPTH),
-                   rev_bank_gross=True, rev_fill_tags=REV_FILL_TAGS, gp_bank_net=True, gp_revenue_without_cost_lines=True)
+                   rev_bank_gross=True, rev_fill_tags=REV_FILL_TAGS, gp_bank_net=True, gp_revenue_without_cost_lines=True,
+                   fcf_net_capex=True, fcf_capex_software=True)
 
 
 def _num(v) -> bool:
@@ -5256,8 +5261,11 @@ def _ttm(review) -> pd.DataFrame:
     return review.ttm.reset_index(drop=True)
 
 
-def _first_window_ytd(review, key: str, ttm: pd.DataFrame, window: int) -> tuple[int | None, float | None]:
-    """Index of the first non-blank value in the window and the YTD the reference adds to it."""
+def _first_window_ytd(review, key: str, ttm: pd.DataFrame, window: int, table=None) -> tuple[int | None, float | None]:
+    """Index of the first non-blank value in the window and the YTD the reference adds to it.
+
+    `table` (a MetricTable) takes the YTD from another cash-flow line at the same window position (e.g. a capex component).
+    """
     col = {"ocf": "ttm_ocf", "capex": "ttm_capex"}[key]
     values = pd.to_numeric(ttm[col], errors="coerce")
     start = max(0, len(ttm) - window)
@@ -5273,7 +5281,8 @@ def _first_window_ytd(review, key: str, ttm: pd.DataFrame, window: int) -> tuple
     if earliest.k == 1:
         return idx, 0.0
     prior = cal.quarter(earliest.fy, earliest.k - 1)
-    row = review.tables[key].get(cal.years[earliest.fy].start, prior.end) if prior is not None else None
+    source = table if table is not None else review.tables[key]
+    row = source.get(cal.years[earliest.fy].start, prior.end) if prior is not None else None
     return idx, (None if row is None else float(row["value"]))
 
 
@@ -5339,6 +5348,41 @@ def _tags_cost_lines(review, ttm: pd.DataFrame, window: int) -> bool:
     return any(pattern.match(tag) for tag in recent["tag"].unique())
 
 
+# Net capex components (us-gaap; the first tag reported for a period is used, as for the review's own lines).
+PPE_PROCEEDS_TAGS = ("ProceedsFromSaleOfPropertyPlantAndEquipment", "ProceedsFromSaleOfProductiveAssets",
+                     "ProceedsFromSaleOfOtherPropertyPlantAndEquipment", "ProceedsFromSaleOfOilAndGasPropertyAndEquipment")
+CAPITALIZED_SOFTWARE_TAGS = ("PaymentsToDevelopSoftware", "PaymentsForSoftware")  # not PaymentsToAcquireSoftware (purchased software)
+
+
+def flow_component(review, name: str, tags: tuple[str, ...]):
+    """(MetricTable, quarterly values) of a cash-flow line built like the review's own flows; cached on the review."""
+    pass  # was: relative import (names are global in the single cell)
+    pass  # was: relative import (names are global in the single cell)
+    pass  # was: relative import (names are global in the single cell)
+    pass  # was: relative import (names are global in the single cell)
+
+    cache = review.__dict__.setdefault("_reference_flows", {})
+    if name not in cache:
+        table = build_metric_table(review.cf, MetricDef(name, name, "duration", "money", True, {US: tuple(tags)}, {}), review.basis, DQLog())
+        cache[name] = (table, None if table.table.empty else quarterly_values(table, review.calendar, DQLog()))
+    return cache[name]
+
+
+def flow_component_ttm(review, ttm: pd.DataFrame, name: str, tags: tuple[str, ...]) -> list:
+    """TTM (same four-quarter build as the review's flows) of a cash-flow line for each row of `ttm` (None where unavailable)."""
+    pass  # was: relative import (names are global in the single cell)
+
+    table, qv = flow_component(review, name, tags)
+    if qv is None:
+        return [None] * len(ttm)
+    by_end = {q.end: q for q in review.calendar.quarters}
+    out = []
+    for end in ttm["quarter_end"]:
+        q = by_end.get(pd.Timestamp(end))
+        out.append(None if q is None else ttm_flow(table, qv, review.calendar, q).value)
+    return out
+
+
 def series_rev(review, ttm: pd.DataFrame, options: ReferenceOptions) -> list:
     values = pd.to_numeric(ttm["ttm_revenue"], errors="coerce").to_numpy(dtype=float)
     if options.rev_fill_tags and np.isnan(values).any():
@@ -5376,12 +5420,20 @@ def series_fcf(review, ttm: pd.DataFrame, options: ReferenceOptions) -> list:
     capex = pd.to_numeric(ttm["ttm_capex"], errors="coerce")
     if options.missing_capex_as_zero:
         capex = capex.where(capex.notna() | ocf.isna(), 0.0)
+    parts = ([("ppe_proceeds", PPE_PROCEEDS_TAGS, -1.0)] if options.fcf_net_capex else []) + \
+        ([("capitalized_software", CAPITALIZED_SOFTWARE_TAGS, 1.0)] if options.fcf_capex_software else [])
+    for name, tags, sign in parts:  # a component not reported for a TTM counts as 0
+        capex = capex + sign * pd.to_numeric(pd.Series(flow_component_ttm(review, ttm, name, tags), index=ttm.index), errors="coerce").fillna(0.0)
     values = list(ocf - capex)
     if options.emulate_first_ytd:
         i, extra_ocf = _first_window_ytd(review, "ocf", ttm, options.window)
         _, extra_capex = _first_window_ytd(review, "capex", ttm, options.window)
+        extra_capex = extra_capex or 0.0
+        for name, tags, sign in parts:
+            _, extra = _first_window_ytd(review, "ocf", ttm, options.window, table=flow_component(review, name, tags)[0])
+            extra_capex += sign * (extra or 0.0)
         if i is not None and extra_ocf is not None and _num(values[i]):
-            values[i] = values[i] + extra_ocf - (extra_capex or 0.0)
+            values[i] = values[i] + extra_ocf - extra_capex
     return values
 
 
