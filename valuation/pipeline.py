@@ -41,6 +41,13 @@ COVER_CLASS_RATIO = 0.85  # cover-page shares below this share of weighted basic
 # discontinued). Measured on 486 tickers it fixes some series (BDX, DLTR, HUBB, SLB) but per-period substitution
 # mixes the two definitions for more filers than it repairs, so the default keeps the total.
 PREFER_CONTINUING_OCF = False
+# Opt-in (off by default): also add TTM rows for fiscal quarters that end before the first filing's own period,
+# i.e. quarters that appear only as comparatives in later filings (IPOs, spin-offs, first XBRL years). The value is
+# how many such quarters to add (the latest ones); True or a negative number adds all of them. Each row's valuation
+# date is the first filing that reports a period ending on that quarter, its balance sheet is the one at the quarter
+# end itself (blank when that instant is not reported), and it is marked `comparative`. Such rows never feed the
+# daily table. The written spec starts at the first filing, so the default adds none.
+INCLUDE_COMPARATIVE_QUARTERS: int | bool = 0
 
 
 @dataclass
@@ -119,14 +126,15 @@ class BalanceSheet:
         self._logged_partial: set[str] = set()
         self._logged_fallback = False
 
-    def at(self, when: pd.Timestamp) -> dict:
+    def at(self, when: pd.Timestamp, instant: pd.Timestamp | None = None) -> dict:
+        """Balance sheet of the latest filing on or before `when` (or, given `instant`, the values at that instant)."""
         out: dict = {}
         cand = self.anchor[self.anchor["filed"] <= when]
         if cand.empty:
             out["bs_reason"] = "no balance sheet filed on or before this date"
             return out
         last = cand.iloc[-1]
-        instant = last["instant"]
+        instant = last["instant"] if instant is None else instant
         out.update(bs_instant=instant, bs_accn=last["accn"], bs_form=last["form"], bs_filed=last["filed"])
         for key in INSTANT_KEYS:
             row = self.tables[key].get(None, instant)
@@ -474,10 +482,15 @@ def _valuation_rows(cf, cal: Calendar, tables, qv, qv_shares, bs: BalanceSheet, 
             dq.add("assumption", "same-day filings", f"{triggers[-1][2]} and {f.accn} were both filed {f.filed.date()}; the later period ({quarter.label}) is the valuation row.", period=f.filed)
             triggers.pop()
         triggers.append((quarter, f.filed, f.accn, f.form, f.regime_taxonomy, f.dominant_currency))
+    comparative = _comparative_triggers(cf, cal, triggers, INCLUDE_COMPARATIVE_QUARTERS)
+    if comparative:
+        dq.add("assumption", "comparative quarters", f"{len(comparative)} TTM row(s) added for quarters before the first filing's period ({comparative[0][0].label} to {comparative[-1][0].label}), reported only as comparatives (opt-in INCLUDE_COMPARATIVE_QUARTERS).")
+    first_real = len(comparative)
+    triggers = comparative + triggers
 
     fy_fallback: list[pd.Timestamp] = []
     fx_rows: list[pd.Timestamp] = []
-    for quarter, filed, accn, form, taxonomy, currency in triggers:
+    for i, (quarter, filed, accn, form, taxonomy, currency) in enumerate(triggers):
         row = {
             "quarter_end": quarter.end,
             "fiscal_quarter": f"Q{quarter.k}",
@@ -530,8 +543,10 @@ def _valuation_rows(cf, cal: Calendar, tables, qv, qv_shares, bs: BalanceSheet, 
         missing = [n for n, v in (("operating cash flow", ocf), ("capex", capex)) if not _num(v)]
         row["fcf_reason"] = f"TTM FCF unavailable: {' and '.join(missing)} missing" if missing else ""
 
-        bal = bs.at(filed)
+        bal = bs.at(filed, instant=quarter.end if i < first_real else None)
         row.update(bal)
+        if first_real:
+            row["comparative"] = i < first_real
         if row.get("equity") is None:
             reasons.append("Parent equity: " + ("not tagged at " + str(bal["bs_instant"].date()) if "bs_instant" in bal else bal.get("bs_reason", "")))
 
@@ -583,6 +598,30 @@ def _valuation_rows(cf, cal: Calendar, tables, qv, qv_shares, bs: BalanceSheet, 
             "TTM EPS is cross-checked against reported EPS; gaps above 5% are logged under eps_crosscheck.",
         )
     return rows, build
+
+
+def _comparative_triggers(cf, cal: Calendar, triggers: list, depth) -> list:
+    """Triggers for calendar quarters ending before the first filing's own period (opt-in, see INCLUDE_COMPARATIVE_QUARTERS)."""
+    if depth is False or not triggers or (depth is not True and int(depth) == 0):
+        return []
+    first_end = triggers[0][0].end
+    earlier = [q for q in cal.quarters if q.end < first_end - pd.Timedelta(days=3)]
+    if depth is not True and int(depth) > 0:
+        earlier = earlier[-int(depth):]
+    f = cf.facts
+    durations = f[f["start"].notna()]
+    info = cf.filings.drop_duplicates("accn").set_index("accn")
+    out = []
+    for q in earlier:
+        hits = durations[(durations["end"] - q.end).abs() <= pd.Timedelta(days=3)].sort_values(["filed", "accn"])
+        if hits.empty:
+            continue
+        first = hits.iloc[0]
+        meta = info.loc[first["accn"]] if first["accn"] in info.index else None
+        taxonomy = meta["regime_taxonomy"] if meta is not None else triggers[0][4]
+        currency = meta["dominant_currency"] if meta is not None else triggers[0][5]
+        out.append((q, first["filed"], first["accn"], first["form"], taxonomy, currency))
+    return out
 
 
 def _build_row(row: dict, key: str, t) -> dict:
@@ -945,6 +984,8 @@ def daily_table(review: Review) -> pd.DataFrame | None:
     prices, ttm = review.prices, review.ttm
     if prices is None or prices.close is None or ttm.empty or review.price_block_reason:
         return None
+    if "comparative" in ttm:
+        ttm = ttm[~ttm["comparative"].fillna(False).astype(bool)]
     rows = ttm.dropna(subset=["valuation_date"]).sort_values("valuation_date").reset_index(drop=True)
     rows = rows.drop_duplicates("valuation_date", keep="last")
     rows["held_row"] = rows.index

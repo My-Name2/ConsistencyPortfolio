@@ -8,6 +8,7 @@ uses pytest's temporary folder, so point --basetemp off the C: drive.
 
 from __future__ import annotations
 
+import dataclasses
 import os
 import shutil
 import subprocess
@@ -520,3 +521,54 @@ def test_single_cell_is_in_sync_with_the_package():
     spec.loader.exec_module(builder)
     committed = (Path(__file__).resolve().parents[1] / "valuation_single_cell.py").read_text(encoding="utf-8")
     assert builder.build() == committed, "run: python -B tools/build_single_cell.py"
+
+
+def _drop_first_year(f):
+    """History starts with the first 2020 10-Q: fiscal 2019 appears only as comparatives in 2020 filings."""
+    for concepts in f.values():
+        for concept in concepts.values():
+            for unit, items in concept["units"].items():
+                concept["units"][unit] = [i for i in items if i["accn"].split("-")[1] != "19"]
+
+
+def test_comparative_quarters_are_opt_in(monkeypatch):
+    import valuation.pipeline as P
+    from valuation.reference import ReferenceOptions, review_counts
+
+    base = _review_with(_drop_first_year)
+    assert base.ttm["quarter_end"].min() == pd.Timestamp("2020-03-31")
+    assert "comparative" not in base.ttm
+    monkeypatch.setattr(P, "INCLUDE_COMPARATIVE_QUARTERS", True)
+    r = _review_with(_drop_first_year)
+    comp = r.ttm[r.ttm["comparative"].astype(bool)]
+    assert list(comp["quarter_end"]) == [pd.Timestamp(d) for d in ("2019-03-31", "2019-06-30", "2019-09-30", "2019-12-31")]
+    q4 = row_for(r, "2019-12-31")
+    assert q4["ttm_revenue"] == pytest.approx(sum(fixture.revenue(2019, k) for k in (1, 2, 3, 4)))
+    assert q4["valuation_date"] == pd.Timestamp(fixture.filed_date(2020, 4))  # first filing reporting fiscal 2019
+    assert row_for(r, "2019-03-31")["valuation_date"] == pd.Timestamp(fixture.filed_date(2020, 1))
+    assert pd.isna(row_for(r, "2019-09-30")["ttm_revenue"])  # would need Q4-2018
+    real = r.ttm[~r.ttm["comparative"].astype(bool)].reset_index(drop=True)
+    assert list(real["ttm_revenue"]) == list(base.ttm["ttm_revenue"])
+    assert r.daily["valuation_date"].min() == base.daily["valuation_date"].min()  # comparative rows never feed the daily table
+    # The reference comparison can keep only the latest N comparative quarters.
+    full, none = review_counts(r, ReferenceOptions(window=57)), review_counts(r, ReferenceOptions(window=57, comparative_depth=0))
+    assert full["Rev"]["#Obs"] == none["Rev"]["#Obs"] + 1 == review_counts(base, ReferenceOptions(window=57))["Rev"]["#Obs"] + 1
+    monkeypatch.setattr(P, "INCLUDE_COMPARATIVE_QUARTERS", 1)
+    one = _review_with(_drop_first_year)
+    assert list(one.ttm.loc[one.ttm["comparative"].astype(bool), "quarter_end"]) == [pd.Timestamp("2019-12-31")]
+
+
+def test_reference_window_by_date(review):
+    from valuation.reference import ReferenceOptions, dated_window, review_counts
+
+    # As of 2025-11-21 an 8-quarter span starts 2023-11-21: quarters ending 2023-12-31 .. 2025-09-30.
+    o = ReferenceOptions(window=8, window_by_date=True)
+    assert dated_window(review, "Rev", o, 0, 8) == 8
+    assert dated_window(review, "Rev", o, 1, 8) == 7  # a window aligned one quarter back keeps the span's start
+    assert review_counts(review, o)["Rev"]["#Obs"] == review_counts(review, ReferenceOptions(window=8))["Rev"]["#Obs"] == 8
+    # Two months later (a quarter newer than our data) the span drops our oldest quarter: the part of it we hold.
+    later = dataclasses.replace(review.inputs, as_of=pd.Timestamp("2026-01-15").date())
+    assert dated_window(dataclasses.replace(review, inputs=later), "Rev", o, 0, 8) == 7
+    # ... unless the reference's latest totals match none of our rows: it holds that newer quarter, so the span is full.
+    newer = pd.Series({"Revenue TTM Total": "1", "CFO TTM Total": "1", "Net Income TTM Total": "1"})
+    assert dated_window(dataclasses.replace(review, inputs=later), "Rev", o, 0, 8, newer) == 8
