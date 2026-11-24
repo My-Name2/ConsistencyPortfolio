@@ -27,6 +27,16 @@ COMPARATIVE_DEPTH = {"Rev": 2, "EPS": 2, "GP": 2, "FCF": None, "CFO": None, "EQ"
 ALIGN_COLUMNS = {"ttm_revenue": "Revenue TTM Total", "ttm_ocf": "CFO TTM Total", "ttm_net_income": "Net Income TTM Total"}
 
 
+# Single-line total revenue tags some filers use for whole spans of years instead of Revenues / contract revenue
+# (CMG FoodAndBeverageRevenue, O / ARE / EXR RealEstateRevenueNet, FANG OilAndGasRevenue, HCA patient service revenue).
+REV_FILL_TAGS = ("RealEstateRevenueNet", "FoodAndBeverageRevenue", "OilAndGasRevenue", "HealthCareOrganizationRevenue",
+                 "HealthCareOrganizationPatientServiceRevenueLessProvisionForBadDebts", "OperatingLeasesIncomeStatementLeaseRevenue")
+BANK_INTEREST_INCOME_TAGS = ("InterestAndDividendIncomeOperating", "InterestIncomeOperating", "InterestAndFeeIncomeLoansAndLeases")
+BANK_INTEREST_EXPENSE_TAGS = ("InterestExpense", "InterestExpenseOperating")
+BANK_NET_INTEREST_TAGS = ("InterestIncomeExpenseNet",)
+BANK_NONINTEREST_TAGS = ("NoninterestIncome",)
+
+
 @dataclass
 class ReferenceOptions:
     window: int = 57  # trailing TTM observations the reference counts over
@@ -58,12 +68,18 @@ class ReferenceOptions:
     equity_fingerprint_mean4: bool = False  # compare EQ's fingerprint as the 4-quarter mean over `window` observations
     equity_history_years: int = 0  # with equity_quarter_ends: only quarter ends after the as-of month's start this many years earlier (0 = no limit)
     eps_net_income: str = "parent"  # with eps_counts_net_income: "parent" (the review's NI attributable to parent) or "common" (NI available to common stockholders)
+    # Revenue (Rev) and gross profit (GP).
+    rev_bank_gross: bool = False  # banks (noninterest income + interest income tagged): Rev = interest income + noninterest income (gross), not net of interest expense
+    rev_fill_tags: tuple = ()  # fill blank TTM revenue from these single-line total-revenue tags (first available per period)
+    gp_bank_net: bool = False  # banks: GP = revenue net of interest expense (net interest income + noninterest income)
+    gp_revenue_when_gm100: bool = False  # where the reference's GM % is 100 (financials without a cost of revenue), GP = Rev
 
     @classmethod
     def reference_compatible(cls) -> "ReferenceOptions":
         return cls(window=57, equity_window=60, record_counts_first=True, emulate_first_ytd=True, missing_capex_as_zero=True, align_window=True,
                    eps_counts_net_income=True, eps_net_income="common", equity_quarter_ends=True, equity_total=True, equity_first_reported=True,
-                   equity_fingerprint_mean4=True, equity_history_years=15, window_by_date=True, comparative_depth=dict(COMPARATIVE_DEPTH))
+                   equity_fingerprint_mean4=True, equity_history_years=15, window_by_date=True, comparative_depth=dict(COMPARATIVE_DEPTH),
+                   rev_bank_gross=True, rev_fill_tags=REV_FILL_TAGS, gp_bank_net=True, gp_revenue_when_gm100=True)
 
 
 def _num(v) -> bool:
@@ -183,12 +199,76 @@ def _first_window_ytd(review, key: str, ttm: pd.DataFrame, window: int) -> tuple
     return idx, (None if row is None else float(row["value"]))
 
 
+def _tag_ttm(review, ttm: pd.DataFrame, tags: tuple) -> np.ndarray:
+    """TTM values per row of `ttm` from a fallback chain of us-gaap duration tags (first available per period), built
+    with the engine's own period logic. Cached on the review."""
+    cache = review.__dict__.setdefault("_reference_tag_ttm", {})
+    key = (tuple(tags), tuple(pd.to_datetime(ttm["quarter_end"])))
+    if key not in cache:
+        from .dq import DQLog
+        from .periods import quarterly_values, ttm_flow
+        from .tags import US, MetricDef
+        from .values import build_metric_table
+
+        metric = MetricDef("reference:" + "+".join(tags), "+".join(tags), "duration", "money", True, {US: tuple(tags)}, {})
+        table = build_metric_table(review.cf, metric, review.basis, DQLog())
+        out = np.full(len(ttm), np.nan)
+        if not table.table.empty:
+            cal = review.calendar
+            by_end = {q.end: q for q in cal.quarters}
+            qv = quarterly_values(table, cal, DQLog())
+            for i, end in enumerate(pd.to_datetime(ttm["quarter_end"])):
+                q = by_end.get(end)
+                v = ttm_flow(table, qv, cal, q).value if q is not None else None
+                out[i] = np.nan if v is None else float(v)
+        cache[key] = out
+    return cache[key]
+
+
+def _fill(values: np.ndarray, fallback: np.ndarray) -> np.ndarray:
+    out = values.copy()
+    blank = np.isnan(out)
+    out[blank] = fallback[blank]
+    return out
+
+
+def _bank_series(review, ttm: pd.DataFrame) -> tuple[np.ndarray, np.ndarray] | None:
+    """(gross revenue, net revenue) for a bank-like filer, or None.
+
+    A filer is treated as a bank when it tags noninterest income and interest income over at least half of the
+    rows. Gross = interest income + noninterest income (else net revenue + interest expense); net = our revenue
+    (else net interest income + noninterest income)."""
+    nonint = _tag_ttm(review, ttm, BANK_NONINTEREST_TAGS)
+    income = _tag_ttm(review, ttm, BANK_INTEREST_INCOME_TAGS)
+    if min(np.isfinite(nonint).sum(), np.isfinite(income).sum()) < max(1, len(ttm) // 2):
+        return None
+    ours = pd.to_numeric(ttm["ttm_revenue"], errors="coerce").to_numpy(dtype=float)
+    net = _fill(ours, _tag_ttm(review, ttm, BANK_NET_INTEREST_TAGS) + nonint)
+    gross = _fill(income + nonint, net + _tag_ttm(review, ttm, BANK_INTEREST_EXPENSE_TAGS))
+    return gross, net
+
+
 def series_rev(review, ttm: pd.DataFrame, options: ReferenceOptions) -> list:
-    return list(pd.to_numeric(ttm["ttm_revenue"], errors="coerce"))
+    values = pd.to_numeric(ttm["ttm_revenue"], errors="coerce").to_numpy(dtype=float)
+    if options.rev_fill_tags and np.isnan(values).any():
+        values = _fill(values, _tag_ttm(review, ttm, tuple(options.rev_fill_tags)))
+    if options.rev_bank_gross:
+        bank = _bank_series(review, ttm)
+        if bank is not None:
+            values = bank[0]
+    return list(values)
 
 
 def series_gp(review, ttm: pd.DataFrame, options: ReferenceOptions) -> list:
-    return list(pd.to_numeric(ttm["ttm_gross_profit"], errors="coerce"))
+    values = pd.to_numeric(ttm["ttm_gross_profit"], errors="coerce").to_numpy(dtype=float)
+    gm = getattr(review, "_reference_gm", None)
+    if options.gp_revenue_when_gm100 and gm is not None and _num(gm) and abs(float(gm) - 100) < 1e-6:
+        return series_rev(review, ttm, options)
+    if options.gp_bank_net:
+        bank = _bank_series(review, ttm)
+        if bank is not None:
+            return list(bank[1])
+    return list(values)
 
 
 def series_cfo(review, ttm: pd.DataFrame, options: ReferenceOptions) -> list:
@@ -372,6 +452,8 @@ def fingerprint_matches(counts: dict[str, dict], reference_row: pd.Series | None
 def review_counts(review, options: ReferenceOptions | None = None, reference_row: pd.Series | None = None) -> dict[str, dict]:
     options = options or ReferenceOptions()
     offset = alignment_offset(review, reference_row) if options.align_window else 0
+    if reference_row is not None:  # the reference's latest gross margin, read by series_gp (gp_revenue_when_gm100)
+        review.__dict__["_reference_gm"] = pd.to_numeric(str(reference_row.get("GM %", "")).replace(",", "").replace("%", ""), errors="coerce")
     out = _counts_at(review, options, offset, reference_row)
     if options.align_by_fingerprint and reference_row is not None:
         best = fingerprint_matches(out, reference_row)

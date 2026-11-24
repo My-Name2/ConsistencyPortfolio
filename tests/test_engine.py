@@ -513,6 +513,38 @@ def test_reference_eps_counts_net_income_available_to_common():
     assert ReferenceOptions.reference_compatible().eps_net_income == "common"
 
 
+def test_reference_bank_revenue_gross_and_gross_profit_net():
+    from valuation.reference import ReferenceOptions, series_gp, series_rev
+
+    def mutate(f):
+        # A bank: revenue is net of interest expense; interest income 1.2x and noninterest income 0.3x of it.
+        _cost_facts(f, "InterestAndDividendIncomeOperating", 1.2)
+        _cost_facts(f, "NoninterestIncome", 0.3)
+
+    r = _review_with(mutate)
+    ttm = r.ttm.reset_index(drop=True)
+    net = ttm["ttm_revenue"].to_numpy(dtype=float)
+    spec, compat = ReferenceOptions(), ReferenceOptions.reference_compatible()
+    assert series_rev(r, ttm, spec) == pytest.approx(list(net), nan_ok=True)  # the written spec keeps our revenue
+    assert series_rev(r, ttm, compat) == pytest.approx(list(1.5 * net), nan_ok=True)  # Zacks: interest income + noninterest income
+    assert series_gp(r, ttm, compat) == pytest.approx(list(net), nan_ok=True)  # Zacks bank gross profit: revenue net of interest expense
+    plain = _review_with(lambda f: None)
+    assert series_rev(plain, plain.ttm.reset_index(drop=True), compat) == pytest.approx(list(plain.ttm["ttm_revenue"]), nan_ok=True)  # not a bank
+
+
+def test_reference_gross_profit_is_revenue_where_the_reference_margin_is_100():
+    from types import SimpleNamespace
+
+    from valuation.reference import ReferenceOptions, series_gp
+
+    ttm = pd.DataFrame({"quarter_end": pd.to_datetime(["2024-03-31", "2024-06-30"]), "ttm_revenue": [100.0, 110.0], "ttm_gross_profit": [float("nan")] * 2})
+    stub = SimpleNamespace(_reference_gm=100.0)
+    assert all(pd.isna(series_gp(stub, ttm, ReferenceOptions())))  # spec: blank stays blank
+    assert series_gp(stub, ttm, ReferenceOptions(gp_revenue_when_gm100=True)) == [100.0, 110.0]
+    stub._reference_gm = 42.0
+    assert all(pd.isna(series_gp(stub, ttm, ReferenceOptions(gp_revenue_when_gm100=True))))
+
+
 def test_single_cell_is_in_sync_with_the_package():
     import importlib.util
 
