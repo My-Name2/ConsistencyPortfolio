@@ -38,7 +38,7 @@ class ReferenceOptions:
     equity_total: bool = False  # EQ includes noncontrolling interest (total equity), not parent equity only
     equity_first_reported: bool = False  # EQ uses each quarter end's value as first reported, not as later restated
     equity_fingerprint_mean4: bool = False  # compare EQ's fingerprint as the 4-quarter mean over `window` observations
-    equity_history_years: int = 0  # with equity_quarter_ends: only quarter ends within this many years before the as-of date (0 = no limit)
+    equity_history_years: int = 0  # with equity_quarter_ends: only quarter ends after the as-of month's start this many years earlier (0 = no limit)
 
     @classmethod
     def reference_compatible(cls) -> "ReferenceOptions":
@@ -192,14 +192,14 @@ def series_eps(review, ttm: pd.DataFrame, options: ReferenceOptions) -> list:
 
 
 def quarter_end_equity(review, last_quarter_end, total: bool = False, first_reported: bool = False, since=None) -> list:
-    """Equity at every fiscal quarter end from `since` to `last_quarter_end` (None where no balance sheet is tagged at that instant).
+    """Equity at every fiscal quarter end after `since` up to `last_quarter_end` (None where no balance sheet is tagged at that instant).
 
     `total` adds noncontrolling interest back (total equity); `first_reported` takes each instant's value from the
     first filing that reported it (a 10-Q or 10-K balance sheet), as the reference does, instead of later restatements.
     """
     last = pd.Timestamp(last_quarter_end)
-    first = pd.Timestamp(since) if since is not None else pd.Timestamp.min
-    ends = sorted({q.end for q in review.calendar.quarters if first <= q.end <= last})
+    after = pd.Timestamp(since) if since is not None else pd.Timestamp.min
+    ends = sorted({q.end for q in review.calendar.quarters if after < q.end <= last})
     equity, nci = review.tables["equity"], review.tables.get("nci")
     column = "first_value" if first_reported else "value"
     out = []
@@ -217,12 +217,26 @@ def quarter_end_equity(review, last_quarter_end, total: bool = False, first_repo
     return out
 
 
+def _equity_since(review, last, options: ReferenceOptions):
+    """Earliest quarter end the reference's equity history holds (exclusive), or None.
+
+    Its quarterly history covers quarters ending after the start of the as-of month N years earlier (as-of 2026-09-14:
+    after 2011-09-01): May-quarter filers whose 60th quarter back ends 2011-08-31 (ACN, COST, MU 2011-09-01) have 59
+    observations there, PEP (2011-09-03) 60. Where our latest quarter is older than a filing deadline allows (a 10-Q
+    missing from the inputs: AEP, DUK, SO end 2026-03-31), the reference holds the newer quarter and its history
+    starts that many quarters earlier.
+    """
+    if not options.equity_history_years:
+        return None
+    as_of = pd.Timestamp(review.inputs.as_of)
+    missing = max(0, int(((as_of - last).days - 45) // 91))  # quarters the reference has after our latest
+    return as_of.replace(day=1) - pd.DateOffset(years=options.equity_history_years, months=3 * missing)
+
+
 def series_eq(review, ttm: pd.DataFrame, options: ReferenceOptions) -> list:
     if options.equity_quarter_ends:
-        # The reference's quarterly history starts 15 years before its as-of date: off-calendar filers whose 60th
-        # quarter back ends before then (ACN 2011-08-31 for an as-of of 2026-09-14) have 59 observations there.
-        since = pd.Timestamp(review.inputs.as_of) - pd.DateOffset(years=options.equity_history_years) if options.equity_history_years else None
-        return quarter_end_equity(review, ttm["quarter_end"].iloc[-1], options.equity_total, options.equity_first_reported, since)
+        last = pd.Timestamp(ttm["quarter_end"].iloc[-1])
+        return quarter_end_equity(review, last, options.equity_total, options.equity_first_reported, _equity_since(review, last, options))
     return list(pd.to_numeric(ttm["equity"], errors="coerce"))
 
 
