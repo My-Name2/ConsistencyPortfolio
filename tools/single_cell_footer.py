@@ -111,6 +111,7 @@ def chart(ticker: str, ratio: str = "pe", series: str = "eps_ttm"):
     return alt.vconcat(top, bottom)
 
 
+INCLUDE_COMPARATIVE_QUARTERS = (REFERENCE_COMPATIBLE if COMPARATIVE_QUARTERS is None else COMPARATIVE_QUARTERS) and True
 REVIEWS, ERRORS, SUMMARY = run_all()
 _display(SUMMARY)
 

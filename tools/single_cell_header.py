@@ -20,6 +20,7 @@ OUTPUT_DIR = None         # None = keep everything in memory; or a folder NOT on
 WRITE_FILES = True        # with OUTPUT_DIR: write <ticker>_valuation.xlsx and <ticker>_report.md per company
 REFERENCE_XLSX = None     # optional CompanyCharts-style workbook to compare #Obs/#Inc/#Rec, e.g. r"D:\data\spy.xlsx"
 REFERENCE_COMPATIBLE = False  # True = apply the reference file's own conventions in that comparison (see notes below)
+COMPARATIVE_QUARTERS = None   # count quarters reported only as comparatives before the first filing: None = same as REFERENCE_COMPATIBLE
 SEC_USER_AGENT = "ValuationReview research-client admin@example.com"  # SEC asks for "Name email"; set your own
 SHOW_FIRST_REPORT = True  # display the first company's report (sections 1-10) after the run
 # --------------------------------------------------------------------------------------
@@ -28,5 +29,9 @@ SHOW_FIRST_REPORT = True  # display the first company's report (sections 1-10) a
 #   * equity is counted over 60 observations, the TTM metrics over 57;
 #   * CFO and FCF: the first value in the window includes the prior year-to-date amount, an artifact of
 #     building quarters from year-to-date data that cannot be differenced at the start of the dataset;
-#   * FCF = CFO where capex is missing.
-# They only change the comparison, never the review, the workbook or the statistics.
+#   * FCF = CFO where capex is missing;
+#   * "EPS TTM" counts use TTM net income available to common stockholders;
+#   * equity = total equity (incl. NCI) at each of the last 60 fiscal quarter ends, as first reported;
+#   * the window is a date span (15 years of quarters), not a fixed number of rows.
+# They only change the comparison, never the review, the workbook or the statistics, except
+# COMPARATIVE_QUARTERS, which also adds those early quarters as observations in each review.
