@@ -4814,12 +4814,13 @@ class ReferenceOptions:
     equity_first_reported: bool = False  # EQ uses each quarter end's value as first reported, not as later restated
     equity_fingerprint_mean4: bool = False  # compare EQ's fingerprint as the 4-quarter mean over `window` observations
     equity_history_years: int = 0  # with equity_quarter_ends: only quarter ends after the as-of month's start this many years earlier (0 = no limit)
+    eps_net_income: str = "parent"  # with eps_counts_net_income: "parent" (the review's NI attributable to parent) or "common" (NI available to common stockholders)
 
     @classmethod
     def reference_compatible(cls) -> "ReferenceOptions":
         return cls(window=57, equity_window=60, record_counts_first=True, emulate_first_ytd=True, missing_capex_as_zero=True, align_window=True,
-                   eps_counts_net_income=True, equity_quarter_ends=True, equity_total=True, equity_first_reported=True, equity_fingerprint_mean4=True,
-                   equity_history_years=15)
+                   eps_counts_net_income=True, eps_net_income="common", equity_quarter_ends=True, equity_total=True, equity_first_reported=True,
+                   equity_fingerprint_mean4=True, equity_history_years=15)
 
 
 def _num(v) -> bool:
@@ -4959,11 +4960,49 @@ def series_fcf(review, ttm: pd.DataFrame, options: ReferenceOptions) -> list:
     return values
 
 
+NI_COMMON_TAG = "NetIncomeLossAvailableToCommonStockholdersBasic"
+
+
+def _ni_available_to_common(review, ttm: pd.DataFrame) -> list:
+    """TTM net income available to common stockholders: the review's TTM NI attributable to parent less the TTM
+    of (NI - NI available to common), the latter taken only from periods where both are tagged and built with the
+    review's period rules (YTD differencing, FY - 9M). Where that TTM difference cannot be built, NI is used as is,
+    so tagging gaps never mix the two tags inside one quarter."""
+    pass  # was: relative import (names are global in the single cell)
+    pass  # was: relative import (names are global in the single cell)
+    pass  # was: relative import (names are global in the single cell)
+    pass  # was: relative import (names are global in the single cell)
+
+    base = list(pd.to_numeric(ttm["ttm_net_income"], errors="coerce"))
+    ni = review.tables["net_income"]
+    common = build_metric_table(review.cf, MetricDef("ni_common", "NI available to common", "duration", "money", True, {US: (NI_COMMON_TAG,), IFRS: ()}), review.basis, DQLog())
+    if ni.table.empty or common.table.empty:
+        return base
+    both = ni.table.merge(common.table[["start", "end", "value"]], on=["start", "end"], suffixes=("", "_common"))
+    if both.empty:
+        return base
+    diff = MetricTable(ni.metric, both.assign(value=both["value"].astype(float) - both["value_common"].astype(float)).drop(columns="value_common"))
+    cal = review.calendar
+    qv = quarterly_values(diff, cal, DQLog())
+    by_end = {q.end: q for q in cal.quarters}
+    out = []
+    for end, value in zip(ttm["quarter_end"], base):
+        q = by_end.get(pd.Timestamp(end))
+        d = ttm_flow(diff, qv, cal, q).value if q is not None and _num(value) else None
+        out.append(value - d if _num(value) and _num(d) else value)
+    return out
+
+
 def series_eps(review, ttm: pd.DataFrame, options: ReferenceOptions) -> list:
     # The reference's "EPS TTM" fingerprint (slope, R2, CV%) equals TTM net income's in $ millions
     # (AAPL 1520.44 / 0.8742 / 38.86%, MSFT 1872.63 / 0.8564 / 68.94%), so its counts use net income.
-    column = "ttm_net_income" if options.eps_counts_net_income else "eps_ttm"
-    return list(pd.to_numeric(ttm[column], errors="coerce"))
+    if not options.eps_counts_net_income:
+        return list(pd.to_numeric(ttm["eps_ttm"], errors="coerce"))
+    if options.eps_net_income == "common":
+        # Its net income is after preferred dividends: JPM 778.82 / 0.8662 (ours with NI to parent 780.43 / 0.8705);
+        # latest "Net Income TTM Total" 63,634 = NI available to common (NI attributable to parent 65,067).
+        return _ni_available_to_common(review, ttm)
+    return list(pd.to_numeric(ttm["ttm_net_income"], errors="coerce"))
 
 
 def quarter_end_equity(review, last_quarter_end, total: bool = False, first_reported: bool = False, since=None) -> list:
