@@ -23,7 +23,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from . import sources
+from . import filings, sources
 from .pipeline import ReviewInputs, run_review
 from .prices import PriceMeta
 from .redflags import InputBDocument
@@ -36,6 +36,7 @@ def fetch_inputs(identifier: str, as_of: date, current_price: float | None = Non
     ticker, cik = sources.resolve(identifier)
     facts = sources.fetch_companyfacts(cik)
     notes = [f"Input A: SEC companyfacts {facts.url} retrieved {facts.retrieved} (UTC)."]
+    warnings = supplement_unindexed(cik, facts.data, as_of, notes)
     prices, meta = None, PriceMeta(ticker=ticker)
     try:
         px = sources.fetch_prices(ticker)
@@ -46,7 +47,30 @@ def fetch_inputs(identifier: str, as_of: date, current_price: float | None = Non
         )
     except Exception as exc:  # prices are optional: price ratios become "no price data"
         notes.append(f"Input C: not available ({exc}).")
-    return ReviewInputs(facts=facts.data, as_of=as_of, prices=prices, price_meta=meta, ticker=ticker, current_price=current_price, filings_text=docs or [], source_notes=notes)
+    return ReviewInputs(facts=facts.data, as_of=as_of, prices=prices, price_meta=meta, ticker=ticker, current_price=current_price, filings_text=docs or [], source_notes=notes, input_warnings=warnings)
+
+
+def supplement_unindexed(cik: str, facts: dict, as_of: date, notes: list[str], fill: bool | None = None) -> list[str]:
+    """Find periodic filings missing from companyfacts; when filling, add their XBRL facts to `facts` in place.
+
+    Returns Data_Quality warnings and appends provenance notes. Checking needs the SEC submissions API; if it
+    cannot be reached, a warning says so and the review uses companyfacts alone.
+    """
+    fill = sources.FILL_UNINDEXED_FILINGS if fill is None else fill
+    try:
+        found = sources.unindexed_filings(cik, facts, as_of, read=fill)
+    except Exception as exc:
+        return [f"Could not check companyfacts for missing filings (SEC submissions API: {type(exc).__name__}: {exc})."]
+    warnings = []
+    for f, text in zip(found, filings.describe(found)):
+        if f.facts:
+            filings.merge_facts(facts, f.rows)
+            notes.append(f"Input A supplement: companyfacts does not include {text} (from the filing on EDGAR).")
+        elif f.form.endswith("/A") and "no non-dimensional facts" in f.instance:
+            notes.append(f"Input A: companyfacts does not include {text}; an amendment without financial statements, nothing to add.")
+        else:
+            warnings.append(f"Companyfacts does not include {text}; figures for its period are missing.")
+    return warnings
 
 
 def local_inputs(args) -> ReviewInputs:

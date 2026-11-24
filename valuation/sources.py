@@ -21,6 +21,7 @@ from pathlib import Path
 import pandas as pd
 import requests
 
+from . import filings
 from .prices import PriceMeta
 
 SEC_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
@@ -33,7 +34,7 @@ def sec_headers() -> dict:
     return {"User-Agent": os.environ.get("SEC_USER_AGENT", DEFAULT_SEC_AGENT), "Accept-Encoding": "gzip, deflate"}
 
 
-def _get(url: str, headers: dict, params: dict | None = None, attempts: int = 4, timeout: int = 60) -> requests.Response:
+def _get(url: str, headers: dict, params: dict | None = None, attempts: int = 4, timeout: int = 60, retry_not_found: bool = False) -> requests.Response:
     delay = 1.0
     last_error = None
     for _ in range(attempts):
@@ -41,7 +42,7 @@ def _get(url: str, headers: dict, params: dict | None = None, attempts: int = 4,
             response = requests.get(url, headers=headers, params=params, timeout=timeout)
             if response.status_code == 200:
                 return response
-            if response.status_code == 404:
+            if response.status_code == 404 and not retry_not_found:
                 response.raise_for_status()
             last_error = RuntimeError(f"HTTP {response.status_code} from {url}")
         except requests.HTTPError:
@@ -122,6 +123,39 @@ def fetch_companyfacts(cik: str) -> FetchedFacts:
     url = SEC_FACTS_URL.format(cik=str(cik).zfill(10))
     response = _get(url, sec_headers())
     return FetchedFacts(str(cik).zfill(10), response.json(), url, datetime.now(timezone.utc).isoformat(timespec="seconds"))
+
+
+# Input A supplement (see filings.py): periodic filings that companyfacts has not indexed are read from
+# each filing's own XBRL instance on EDGAR. False = only detect them and warn under Data_Quality.
+FILL_UNINDEXED_FILINGS = True
+
+
+def fetch_submissions(cik: str) -> dict:
+    return _get(filings.SUBMISSIONS_URL.format(cik=str(cik).zfill(10)), sec_headers()).json()
+
+
+def unindexed_filings(cik: str, companyfacts: dict, as_of, read: bool = True) -> list[filings.UnindexedFiling]:
+    """Periodic filings on or before `as_of` missing from `companyfacts`; with `read`, their XBRL facts are parsed."""
+    found = filings.find_unindexed(companyfacts, fetch_submissions(cik), as_of)
+    for f in found:
+        if not read:
+            f.instance = "FILL_UNINDEXED_FILINGS is off"
+            continue
+        folder = f.accn.replace("-", "")
+        try:
+            index = _get(filings.ARCHIVE_INDEX_URL.format(cik=int(cik), folder=folder), sec_headers(), retry_not_found=True).json()
+            name = filings.pick_instance(index, f.primary_document)
+            if not name:
+                f.instance = "no XBRL instance in the filing folder"
+                continue
+            data = _get(filings.ARCHIVE_FILE_URL.format(cik=int(cik), folder=folder, name=name), sec_headers(), timeout=180, retry_not_found=True).content
+            f.rows = filings.parse_instance(data, cik, f.accn, f.form, f.filed)
+        except Exception as exc:  # one unreadable filing must not stop the review
+            f.instance = f"could not read: {type(exc).__name__}: {exc}"
+            continue
+        f.facts = sum(len(items) for tags in f.rows.values() for by_unit in tags.values() for items in by_unit.values())
+        f.instance = name if f.facts else f"{name} has no non-dimensional facts for this CIK"
+    return found
 
 
 # ------------------------------------------------------------------ Input C

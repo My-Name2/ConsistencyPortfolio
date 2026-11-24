@@ -21,6 +21,7 @@ WRITE_FILES = True        # with OUTPUT_DIR: write <ticker>_valuation.xlsx and <
 REFERENCE_XLSX = None     # optional CompanyCharts-style workbook to compare #Obs/#Inc/#Rec, e.g. r"D:\data\spy.xlsx"
 REFERENCE_COMPATIBLE = False  # True = apply the reference file's own conventions in that comparison (see notes below)
 COMPARATIVE_QUARTERS = None   # count quarters reported only as comparatives before the first filing: None = same as REFERENCE_COMPATIBLE
+FILL_MISSING_FILINGS = True  # read 10-Qs/10-Ks that SEC companyfacts has not indexed from the filing's own XBRL on EDGAR (False = only warn)
 SEC_USER_AGENT = "ValuationReview research-client admin@example.com"  # SEC asks for "Name email"; set your own
 SHOW_FIRST_REPORT = True  # display the first company's report (sections 1-10) after the run
 # --------------------------------------------------------------------------------------

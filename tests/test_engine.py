@@ -604,3 +604,88 @@ def test_reference_window_by_date(review):
     # ... unless the reference's latest totals match none of our rows: it holds that newer quarter, so the span is full.
     newer = pd.Series({"Revenue TTM Total": "1", "CFO TTM Total": "1", "Net Income TTM Total": "1"})
     assert dated_window(dataclasses.replace(review, inputs=later), "Rev", o, 0, 8, newer) == 8
+
+
+# ---------------------------------------------------------------- Input A supplement (filings missing from companyfacts)
+
+_INSTANCE = b"""<?xml version="1.0" encoding="utf-8"?>
+<xbrli:xbrl xmlns:xbrli="http://www.xbrl.org/2003/instance" xmlns:us-gaap="http://fasb.org/us-gaap/2025"
+  xmlns:dei="http://xbrl.sec.gov/dei/2025" xmlns:co="http://example.com/co/20260630" xmlns:xbrldi="http://xbrl.org/2006/xbrldi"
+  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <xbrli:context id="q"><xbrli:entity><xbrli:identifier scheme="http://www.sec.gov/CIK">0000000042</xbrli:identifier></xbrli:entity>
+    <xbrli:period><xbrli:startDate>2026-04-01</xbrli:startDate><xbrli:endDate>2026-06-30</xbrli:endDate></xbrli:period></xbrli:context>
+  <xbrli:context id="i"><xbrli:entity><xbrli:identifier scheme="http://www.sec.gov/CIK">0000000042</xbrli:identifier></xbrli:entity>
+    <xbrli:period><xbrli:instant>2026-06-30</xbrli:instant></xbrli:period></xbrli:context>
+  <xbrli:context id="seg"><xbrli:entity><xbrli:identifier scheme="http://www.sec.gov/CIK">0000000042</xbrli:identifier>
+    <xbrli:segment><xbrldi:explicitMember dimension="dei:LegalEntityAxis">co:SubMember</xbrldi:explicitMember></xbrli:segment></xbrli:entity>
+    <xbrli:period><xbrli:startDate>2026-04-01</xbrli:startDate><xbrli:endDate>2026-06-30</xbrli:endDate></xbrli:period></xbrli:context>
+  <xbrli:context id="other"><xbrli:entity><xbrli:identifier scheme="http://www.sec.gov/CIK">0000000099</xbrli:identifier></xbrli:entity>
+    <xbrli:period><xbrli:startDate>2026-04-01</xbrli:startDate><xbrli:endDate>2026-06-30</xbrli:endDate></xbrli:period></xbrli:context>
+  <xbrli:unit id="usd"><xbrli:measure>iso4217:USD</xbrli:measure></xbrli:unit>
+  <xbrli:unit id="sh"><xbrli:measure>xbrli:shares</xbrli:measure></xbrli:unit>
+  <xbrli:unit id="eps"><xbrli:divide><xbrli:unitNumerator><xbrli:measure>iso4217:USD</xbrli:measure></xbrli:unitNumerator>
+    <xbrli:unitDenominator><xbrli:measure>xbrli:shares</xbrli:measure></xbrli:unitDenominator></xbrli:divide></xbrli:unit>
+  <dei:DocumentFiscalYearFocus contextRef="q">2026</dei:DocumentFiscalYearFocus>
+  <dei:DocumentFiscalPeriodFocus contextRef="q">Q2</dei:DocumentFiscalPeriodFocus>
+  <us-gaap:Revenues contextRef="q" unitRef="usd" decimals="-6">1500000000</us-gaap:Revenues>
+  <us-gaap:Revenues contextRef="q" unitRef="usd" decimals="-5">1500000000</us-gaap:Revenues>
+  <us-gaap:Revenues contextRef="seg" unitRef="usd" decimals="-6">900000000</us-gaap:Revenues>
+  <us-gaap:Revenues contextRef="other" unitRef="usd" decimals="-6">700000000</us-gaap:Revenues>
+  <us-gaap:EarningsPerShareDiluted contextRef="q" unitRef="eps" decimals="2">1.25</us-gaap:EarningsPerShareDiluted>
+  <us-gaap:StockholdersEquity contextRef="i" unitRef="usd" decimals="-6">8000000000</us-gaap:StockholdersEquity>
+  <us-gaap:Liabilities contextRef="i" unitRef="usd" xsi:nil="true"/>
+  <dei:EntityCommonStockSharesOutstanding contextRef="i" unitRef="sh" decimals="0">400000000</dei:EntityCommonStockSharesOutstanding>
+  <co:CustomMetric contextRef="q" unitRef="usd" decimals="-6">5000000</co:CustomMetric>
+</xbrli:xbrl>"""
+
+
+def test_filing_instance_parses_to_companyfacts_rows():
+    from valuation.filings import parse_instance
+
+    rows = parse_instance(_INSTANCE, "0000000042", "0000000042-26-000040", "10-Q", "2026-08-04")
+    assert set(rows) == {"us-gaap", "dei"}  # the company's own taxonomy is left out, as in companyfacts
+    rev = rows["us-gaap"]["Revenues"]["USD"]
+    # one row: the duplicate is dropped, the dimensional and the other entity's facts are left out
+    assert rev == [{"start": "2026-04-01", "end": "2026-06-30", "val": 1500000000, "accn": "0000000042-26-000040",
+                    "fy": 2026, "fp": "Q2", "form": "10-Q", "filed": "2026-08-04"}]
+    assert rows["us-gaap"]["EarningsPerShareDiluted"]["USD/shares"][0]["val"] == 1.25
+    assert "start" not in rows["us-gaap"]["StockholdersEquity"]["USD"][0]  # instants carry only an end date
+    assert "Liabilities" not in rows["us-gaap"]  # nil facts are skipped
+    assert rows["dei"]["EntityCommonStockSharesOutstanding"]["shares"][0]["val"] == 400000000
+
+
+def test_unindexed_filings_are_found_and_merged():
+    from datetime import date
+
+    from valuation.filings import find_unindexed, merge_facts, parse_instance
+
+    cf = fixture.companyfacts()
+    have = sorted({i["accn"] for tags in cf["facts"].values() for p in tags.values() for items in p["units"].values() for i in items})
+    subs = {"filings": {"recent": {
+        "form": ["10-Q", "10-Q", "8-K", "10-Q", "10-K"],
+        "filingDate": ["2026-11-05", "2026-08-04", "2026-08-01", "2026-05-05", "2018-02-01"],
+        "reportDate": ["2026-09-30", "2026-06-30", "", "2026-03-31", "2017-12-31"],
+        "accessionNumber": ["0000000042-26-000051", "0000000042-26-000040", "0000000042-26-000039", have[-1], "0000000042-18-000001"],
+        "primaryDocument": ["co-20260930.htm", "co-20260630.htm", "x.htm", "co-20260331.htm", "co-20171231.htm"],
+        "isXBRL": [1, 1, 1, 1, 1]}}}
+    found = find_unindexed(cf, subs, date(2026, 9, 14))
+    # only the periodic filing on or before the as-of date, not already indexed, within the look-back window
+    assert [f.accn for f in found] == ["0000000042-26-000040"]
+    rows = parse_instance(_INSTANCE, "0000000042", found[0].accn, found[0].form, found[0].filed)
+    before = len(cf["facts"]["us-gaap"].get("Revenues", {}).get("units", {}).get("USD", []))
+    assert merge_facts(cf, rows) == 4
+    assert len(cf["facts"]["us-gaap"]["Revenues"]["units"]["USD"]) == before + 1
+
+
+def test_supplement_warns_when_not_filling(monkeypatch):
+    from datetime import date
+
+    from valuation import cli, filings, sources
+
+    found = [filings.UnindexedFiling("0000000042-26-000040", "10-Q", "2026-08-04", "2026-06-30", "co-20260630.htm", instance="FILL_UNINDEXED_FILINGS is off")]
+    monkeypatch.setattr(sources, "unindexed_filings", lambda cik, facts, as_of, read=True: found)
+    notes: list[str] = []
+    warnings = cli.supplement_unindexed("42", {"facts": {}}, date(2026, 9, 14), notes, fill=False)
+    assert notes == [] and len(warnings) == 1 and "0000000042-26-000040" in warnings[0]
+    r = run_review(ReviewInputs(facts=fixture.companyfacts(), as_of=date(2026, 9, 14), input_warnings=warnings))
+    assert any("0000000042-26-000040" in d for d in r.dq.frame()["detail"])

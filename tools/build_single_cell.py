@@ -17,7 +17,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 PKG = ROOT / "valuation"
 # Dependency order: each module only uses names defined by modules above it.
-MODULES = ["tags", "dq", "storage", "facts", "splits", "values", "periods", "prices", "ratios", "stats", "redflags", "pipeline", "sources", "workbook", "report", "reference", "cli"]
+MODULES = ["tags", "dq", "storage", "facts", "splits", "values", "periods", "prices", "ratios", "stats", "redflags", "pipeline", "filings", "sources", "workbook", "report", "reference", "cli"]
 RELATIVE = re.compile(r"^(?P<indent>\s*)from \.[\w.]* import (?P<rest>.*)$")
 
 
@@ -48,6 +48,15 @@ def strip_module(name: str, text: str) -> str:
         # The argparse entry point and its __main__ guard do not belong in a notebook cell.
         cut = text.index("\ndef main(")
         text = text[:cut] + "\n"
+    if name == "filings":
+        text += (
+            "\n\n# cli.py and sources.py refer to these as filings.<name>; in the single cell they are plain globals.\n"
+            "import types as _types\n\n"
+            "filings = _types.SimpleNamespace(\n"
+            "    SUBMISSIONS_URL=SUBMISSIONS_URL, ARCHIVE_INDEX_URL=ARCHIVE_INDEX_URL, ARCHIVE_FILE_URL=ARCHIVE_FILE_URL, UnindexedFiling=UnindexedFiling,\n"
+            "    find_unindexed=find_unindexed, pick_instance=pick_instance, parse_instance=parse_instance, merge_facts=merge_facts, describe=describe,\n"
+            ")\n"
+        )
     if name == "sources":
         tickers = (PKG / "default_tickers.txt").read_text(encoding="utf-8")
         text += (
@@ -59,6 +68,7 @@ def strip_module(name: str, text: str) -> str:
             "sources = _types.SimpleNamespace(\n"
             "    resolve=resolve, fetch_companyfacts=fetch_companyfacts, fetch_prices=fetch_prices,\n"
             "    default_tickers=default_tickers, read_ticker_file=read_ticker_file, parse_ticker_list=parse_ticker_list, ticker_map=ticker_map,\n"
+            "    fetch_submissions=fetch_submissions, unindexed_filings=unindexed_filings, FILL_UNINDEXED_FILINGS=FILL_UNINDEXED_FILINGS,\n"
             ")\n"
         )
     return text

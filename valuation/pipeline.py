@@ -61,6 +61,7 @@ class ReviewInputs:
     current_price: float | None = None  # Input D price, if given
     ticker: str = ""
     source_notes: list[str] = field(default_factory=list)  # provenance of Inputs A and C
+    input_warnings: list[str] = field(default_factory=list)  # Input A problems found while fetching (e.g. filings missing from companyfacts)
 
 
 @dataclass
@@ -326,6 +327,8 @@ def run_review(inp: ReviewInputs) -> Review:
     cf = load_companyfacts(inp.facts, inp.as_of)
     for note in inp.source_notes:
         dq.add("input", "provenance", note)
+    for warning in inp.input_warnings:
+        dq.add("input", "Input A", warning, severity="warning")
     if cf.excluded_after_asof:
         dq.add("input", "Input A", f"{cf.excluded_after_asof:,} facts filed after the as-of date {as_of.date()} were excluded (no look-ahead).")
     dq.add("input", "Input B", f"{len(inp.filings_text)} excerpt(s) supplied." if inp.filings_text else "Not supplied: going-concern, auditor-opinion, material-weakness and auditor-change screens are not assessable.")

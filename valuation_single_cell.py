@@ -21,6 +21,7 @@ WRITE_FILES = True        # with OUTPUT_DIR: write <ticker>_valuation.xlsx and <
 REFERENCE_XLSX = None     # optional CompanyCharts-style workbook to compare #Obs/#Inc/#Rec, e.g. r"D:\data\spy.xlsx"
 REFERENCE_COMPATIBLE = False  # True = apply the reference file's own conventions in that comparison (see notes below)
 COMPARATIVE_QUARTERS = None   # count quarters reported only as comparatives before the first filing: None = same as REFERENCE_COMPATIBLE
+FILL_MISSING_FILINGS = True  # read 10-Qs/10-Ks that SEC companyfacts has not indexed from the filing's own XBRL on EDGAR (False = only warn)
 SEC_USER_AGENT = "ValuationReview research-client admin@example.com"  # SEC asks for "Name email"; set your own
 SHOW_FIRST_REPORT = True  # display the first company's report (sections 1-10) after the run
 # --------------------------------------------------------------------------------------
@@ -2741,6 +2742,7 @@ class ReviewInputs:
     current_price: float | None = None  # Input D price, if given
     ticker: str = ""
     source_notes: list[str] = field(default_factory=list)  # provenance of Inputs A and C
+    input_warnings: list[str] = field(default_factory=list)  # Input A problems found while fetching (e.g. filings missing from companyfacts)
 
 
 @dataclass
@@ -3006,6 +3008,8 @@ def run_review(inp: ReviewInputs) -> Review:
     cf = load_companyfacts(inp.facts, inp.as_of)
     for note in inp.source_notes:
         dq.add("input", "provenance", note)
+    for warning in inp.input_warnings:
+        dq.add("input", "Input A", warning, severity="warning")
     if cf.excluded_after_asof:
         dq.add("input", "Input A", f"{cf.excluded_after_asof:,} facts filed after the as-of date {as_of.date()} were excluded (no look-ahead).")
     dq.add("input", "Input B", f"{len(inp.filings_text)} excerpt(s) supplied." if inp.filings_text else "Not supplied: going-concern, auditor-opinion, material-weakness and auditor-change screens are not assessable.")
@@ -3717,6 +3721,219 @@ def _daily_counts(review: Review) -> dict:
     window = daily[daily["in_display_window"]]
     return {r.key: int(window[r.key].notna().sum()) for r in DAILY_RATIOS}
 
+# ============================== valuation/filings.py ==============================
+"""Input A supplement: XBRL facts of periodic filings that SEC companyfacts has not indexed.
+
+SEC's companyfacts API sometimes leaves out a company's recent 10-Q or 10-K, although the filing and its
+XBRL are on EDGAR. For example, Duke Energy's 10-Qs filed 2026-08-04 and 2026-11-05 are missing from
+companyfacts, which does include its later prospectus filings. Without them the review's latest quarter is
+stale.
+
+This module finds those filings with the SEC submissions API (same company, same SEC data) and reads each
+one's own XBRL instance into the companyfacts layout. It keeps only what companyfacts keeps:
+- numeric facts without dimensions;
+- of the us-gaap, ifrs-full, dei, srt and invest taxonomies;
+- for the filer's own CIK;
+- with the filing's accession number, form, filing date and fiscal year/period focus.
+
+`find_unindexed` only reads; `merge_facts` adds the rows. Both are opt-in in the fetch layer, and the review
+lists every filing added this way under Data_Quality. Nothing is written to disk.
+"""
+
+
+import io
+import re
+import xml.etree.ElementTree as ET
+from dataclasses import dataclass, field
+from datetime import date, timedelta
+
+SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik}.json"
+ARCHIVE_INDEX_URL = "https://www.sec.gov/Archives/edgar/data/{cik}/{folder}/index.json"
+ARCHIVE_FILE_URL = "https://www.sec.gov/Archives/edgar/data/{cik}/{folder}/{name}"
+
+SUPPLEMENT_FORMS = {"10-K", "10-K/A", "10-Q", "10-Q/A", "10-KT", "10-KT/A", "10-QT", "10-QT/A", "20-F", "20-F/A", "40-F", "40-F/A"}
+LOOKBACK_YEARS = 3  # only filings this recent are checked against companyfacts
+MAX_FILINGS = 8  # at most this many filings are read per company
+
+_XBRLI = "{http://www.xbrl.org/2003/instance}"
+_TAXONOMIES = (
+    ("us-gaap", re.compile(r"^https?://(www\.)?fasb\.org/us-gaap/")),
+    ("srt", re.compile(r"^https?://(www\.)?fasb\.org/srt/")),
+    ("dei", re.compile(r"^https?://xbrl\.sec\.gov/dei/")),
+    ("invest", re.compile(r"^https?://xbrl\.sec\.gov/invest/")),
+    ("ifrs-full", re.compile(r"^https?://xbrl\.ifrs\.org/taxonomy/")),
+)
+
+
+@dataclass
+class UnindexedFiling:
+    accn: str
+    form: str
+    filed: str
+    report_date: str
+    primary_document: str
+    facts: int = 0  # facts read from its XBRL instance
+    instance: str = ""  # instance file name, or why none was read
+    rows: dict = field(default_factory=dict, repr=False)  # {taxonomy: {tag: {unit: [row, ...]}}}
+
+
+def indexed_accessions(companyfacts: dict) -> set[str]:
+    out = set()
+    for tags in (companyfacts.get("facts") or {}).values():
+        for payload in tags.values():
+            for items in (payload.get("units") or {}).values():
+                out.update(item.get("accn") for item in items)
+    out.discard(None)
+    return out
+
+
+def find_unindexed(companyfacts: dict, submissions: dict, as_of: date) -> list[UnindexedFiling]:
+    """Periodic XBRL filings on or before `as_of` (last LOOKBACK_YEARS) that companyfacts does not contain."""
+    have = indexed_accessions(companyfacts)
+    recent = ((submissions or {}).get("filings") or {}).get("recent") or {}
+    forms = recent.get("form") or []
+    cutoff = (as_of - timedelta(days=round(365.25 * LOOKBACK_YEARS))).isoformat()
+    out = []
+    for i, form in enumerate(forms):
+        filed = (recent.get("filingDate") or [""] * len(forms))[i]
+        accn = (recent.get("accessionNumber") or [""] * len(forms))[i]
+        is_xbrl = (recent.get("isXBRL") or [1] * len(forms))[i]
+        if form not in SUPPLEMENT_FORMS or not is_xbrl or not accn or accn in have:
+            continue
+        if not filed or filed > as_of.isoformat() or filed < cutoff:
+            continue
+        out.append(UnindexedFiling(accn, form, filed, (recent.get("reportDate") or [""] * len(forms))[i],
+                                   (recent.get("primaryDocument") or [""] * len(forms))[i]))
+    out.sort(key=lambda f: (f.filed, f.accn), reverse=True)
+    return out[:MAX_FILINGS]
+
+
+def pick_instance(index: dict, primary_document: str = "") -> str:
+    """The XBRL instance in a filing folder: the extracted inline-XBRL instance (<doc>_htm.xml) or a plain one."""
+    names = [item.get("name", "") for item in ((index or {}).get("directory") or {}).get("item", [])]
+    stem = primary_document.rsplit(".", 1)[0] if primary_document else ""
+    if stem and f"{stem}_htm.xml" in names:
+        return f"{stem}_htm.xml"
+    extracted = [n for n in names if n.endswith("_htm.xml")]
+    if extracted:
+        return extracted[0]
+    plain = [n for n in names if n.endswith(".xml") and not re.search(r"_(cal|def|lab|pre)\.xml$|FilingSummary|MetaLinks", n)]
+    return plain[0] if plain else ""
+
+
+def _taxonomy(namespace: str) -> str | None:
+    for name, pattern in _TAXONOMIES:
+        if pattern.match(namespace):
+            return name
+    return None
+
+
+def _unit_name(unit: ET.Element) -> str:
+    def measure(node):
+        text = (node.text or "").strip()
+        return text.split(":", 1)[1] if ":" in text else text
+
+    divide = unit.find(f"{_XBRLI}divide")
+    if divide is not None:
+        num = divide.find(f"{_XBRLI}unitNumerator/{_XBRLI}measure")
+        den = divide.find(f"{_XBRLI}unitDenominator/{_XBRLI}measure")
+        return f"{measure(num)}/{measure(den)}" if num is not None and den is not None else ""
+    parts = [measure(m) for m in unit.findall(f"{_XBRLI}measure")]
+    return "*".join(parts)
+
+
+def _number(text: str):
+    value = float(text)
+    return int(value) if value.is_integer() and abs(value) < 2**53 else value
+
+
+def parse_instance(data: bytes, cik: str, accn: str, form: str, filed: str) -> dict:
+    """Facts of one XBRL instance as {taxonomy: {tag: {unit: [companyfacts-style row, ...]}}}."""
+    root = ET.parse(io.BytesIO(data)).getroot()
+    own = str(int(cik)) if str(cik).strip().isdigit() else str(cik)
+    contexts = {}
+    for ctx in root.iter(f"{_XBRLI}context"):
+        entity = ctx.find(f"{_XBRLI}entity")
+        ident = entity.find(f"{_XBRLI}identifier") if entity is not None else None
+        if ident is None or (ident.text or "").strip().lstrip("0") != own:
+            continue
+        if entity.find(f"{_XBRLI}segment") is not None or ctx.find(f"{_XBRLI}scenario") is not None:
+            continue  # dimensional: companyfacts leaves these out
+        period = ctx.find(f"{_XBRLI}period")
+        instant = period.find(f"{_XBRLI}instant") if period is not None else None
+        start = period.find(f"{_XBRLI}startDate") if period is not None else None
+        end = period.find(f"{_XBRLI}endDate") if period is not None else None
+        if instant is not None:
+            contexts[ctx.get("id")] = (None, (instant.text or "").strip()[:10])
+        elif start is not None and end is not None:
+            contexts[ctx.get("id")] = ((start.text or "").strip()[:10], (end.text or "").strip()[:10])
+    units = {u.get("id"): _unit_name(u) for u in root.iter(f"{_XBRLI}unit")}
+
+    focus = {}
+    for el in root:
+        if el.tag.endswith("}DocumentFiscalYearFocus") or el.tag.endswith("}DocumentFiscalPeriodFocus"):
+            if el.get("contextRef") in contexts and (el.text or "").strip():
+                focus[el.tag.rsplit("}", 1)[1]] = el.text.strip()
+    fy = focus.get("DocumentFiscalYearFocus")
+    fy = int(fy) if fy and fy.isdigit() else None
+    fp = focus.get("DocumentFiscalPeriodFocus")
+
+    out: dict = {}
+    seen = set()
+    for el in root:
+        ref, unit_ref = el.get("contextRef"), el.get("unitRef")
+        if not ref or not unit_ref or ref not in contexts or not el.tag.startswith("{"):
+            continue
+        if el.get("{http://www.w3.org/2001/XMLSchema-instance}nil") == "true":
+            continue
+        namespace, tag = el.tag[1:].split("}", 1)
+        taxonomy = _taxonomy(namespace)
+        unit = units.get(unit_ref)
+        if taxonomy is None or not unit:
+            continue
+        try:
+            value = _number((el.text or "").strip())
+        except ValueError:
+            continue
+        start, end = contexts[ref]
+        key = (taxonomy, tag, unit, start, end)
+        if key in seen:  # the same fact can appear more than once in an instance
+            continue
+        seen.add(key)
+        row = {"end": end, "val": value, "accn": accn, "fy": fy, "fp": fp, "form": form, "filed": filed}
+        if start is not None:
+            row = {"start": start, **row}
+        out.setdefault(taxonomy, {}).setdefault(tag, {}).setdefault(unit, []).append(row)
+    return out
+
+
+def merge_facts(companyfacts: dict, rows: dict) -> int:
+    """Add parsed rows to a companyfacts dict in place. Returns the number of rows added."""
+    facts = companyfacts.setdefault("facts", {})
+    added = 0
+    for taxonomy, tags in rows.items():
+        for tag, by_unit in tags.items():
+            payload = facts.setdefault(taxonomy, {}).setdefault(tag, {"label": tag, "description": "", "units": {}})
+            for unit, items in by_unit.items():
+                payload.setdefault("units", {}).setdefault(unit, []).extend(items)
+                added += len(items)
+    return added
+
+
+def describe(filings: list[UnindexedFiling]) -> list[str]:
+    return [f"{f.form} filed {f.filed} (accession {f.accn}, period {f.report_date}): "
+            + (f"{f.facts} facts read from {f.instance}" if f.facts else f"not read ({f.instance or 'no XBRL instance'})")
+            for f in filings]
+
+
+# cli.py and sources.py refer to these as filings.<name>; in the single cell they are plain globals.
+import types as _types
+
+filings = _types.SimpleNamespace(
+    SUBMISSIONS_URL=SUBMISSIONS_URL, ARCHIVE_INDEX_URL=ARCHIVE_INDEX_URL, ARCHIVE_FILE_URL=ARCHIVE_FILE_URL, UnindexedFiling=UnindexedFiling,
+    find_unindexed=find_unindexed, pick_instance=pick_instance, parse_instance=parse_instance, merge_facts=merge_facts, describe=describe,
+)
+
 # ============================== valuation/sources.py ==============================
 """Fetch Inputs A and C for a ticker into memory.
 
@@ -3751,7 +3968,7 @@ def sec_headers() -> dict:
     return {"User-Agent": os.environ.get("SEC_USER_AGENT", DEFAULT_SEC_AGENT), "Accept-Encoding": "gzip, deflate"}
 
 
-def _get(url: str, headers: dict, params: dict | None = None, attempts: int = 4, timeout: int = 60) -> requests.Response:
+def _get(url: str, headers: dict, params: dict | None = None, attempts: int = 4, timeout: int = 60, retry_not_found: bool = False) -> requests.Response:
     delay = 1.0
     last_error = None
     for _ in range(attempts):
@@ -3759,7 +3976,7 @@ def _get(url: str, headers: dict, params: dict | None = None, attempts: int = 4,
             response = requests.get(url, headers=headers, params=params, timeout=timeout)
             if response.status_code == 200:
                 return response
-            if response.status_code == 404:
+            if response.status_code == 404 and not retry_not_found:
                 response.raise_for_status()
             last_error = RuntimeError(f"HTTP {response.status_code} from {url}")
         except requests.HTTPError:
@@ -3842,6 +4059,39 @@ def fetch_companyfacts(cik: str) -> FetchedFacts:
     return FetchedFacts(str(cik).zfill(10), response.json(), url, datetime.now(timezone.utc).isoformat(timespec="seconds"))
 
 
+# Input A supplement (see filings.py): periodic filings that companyfacts has not indexed are read from
+# each filing's own XBRL instance on EDGAR. False = only detect them and warn under Data_Quality.
+FILL_UNINDEXED_FILINGS = True
+
+
+def fetch_submissions(cik: str) -> dict:
+    return _get(filings.SUBMISSIONS_URL.format(cik=str(cik).zfill(10)), sec_headers()).json()
+
+
+def unindexed_filings(cik: str, companyfacts: dict, as_of, read: bool = True) -> list[filings.UnindexedFiling]:
+    """Periodic filings on or before `as_of` missing from `companyfacts`; with `read`, their XBRL facts are parsed."""
+    found = filings.find_unindexed(companyfacts, fetch_submissions(cik), as_of)
+    for f in found:
+        if not read:
+            f.instance = "FILL_UNINDEXED_FILINGS is off"
+            continue
+        folder = f.accn.replace("-", "")
+        try:
+            index = _get(filings.ARCHIVE_INDEX_URL.format(cik=int(cik), folder=folder), sec_headers(), retry_not_found=True).json()
+            name = filings.pick_instance(index, f.primary_document)
+            if not name:
+                f.instance = "no XBRL instance in the filing folder"
+                continue
+            data = _get(filings.ARCHIVE_FILE_URL.format(cik=int(cik), folder=folder, name=name), sec_headers(), timeout=180, retry_not_found=True).content
+            f.rows = filings.parse_instance(data, cik, f.accn, f.form, f.filed)
+        except Exception as exc:  # one unreadable filing must not stop the review
+            f.instance = f"could not read: {type(exc).__name__}: {exc}"
+            continue
+        f.facts = sum(len(items) for tags in f.rows.values() for by_unit in tags.values() for items in by_unit.values())
+        f.instance = name if f.facts else f"{name} has no non-dimensional facts for this CIK"
+    return found
+
+
 # ------------------------------------------------------------------ Input C
 
 @dataclass
@@ -3912,6 +4162,7 @@ import types as _types
 sources = _types.SimpleNamespace(
     resolve=resolve, fetch_companyfacts=fetch_companyfacts, fetch_prices=fetch_prices,
     default_tickers=default_tickers, read_ticker_file=read_ticker_file, parse_ticker_list=parse_ticker_list, ticker_map=ticker_map,
+    fetch_submissions=fetch_submissions, unindexed_filings=unindexed_filings, FILL_UNINDEXED_FILINGS=FILL_UNINDEXED_FILINGS,
 )
 
 # ============================== valuation/workbook.py ==============================
@@ -5419,6 +5670,7 @@ def fetch_inputs(identifier: str, as_of: date, current_price: float | None = Non
     ticker, cik = sources.resolve(identifier)
     facts = sources.fetch_companyfacts(cik)
     notes = [f"Input A: SEC companyfacts {facts.url} retrieved {facts.retrieved} (UTC)."]
+    warnings = supplement_unindexed(cik, facts.data, as_of, notes)
     prices, meta = None, PriceMeta(ticker=ticker)
     try:
         px = sources.fetch_prices(ticker)
@@ -5429,7 +5681,30 @@ def fetch_inputs(identifier: str, as_of: date, current_price: float | None = Non
         )
     except Exception as exc:  # prices are optional: price ratios become "no price data"
         notes.append(f"Input C: not available ({exc}).")
-    return ReviewInputs(facts=facts.data, as_of=as_of, prices=prices, price_meta=meta, ticker=ticker, current_price=current_price, filings_text=docs or [], source_notes=notes)
+    return ReviewInputs(facts=facts.data, as_of=as_of, prices=prices, price_meta=meta, ticker=ticker, current_price=current_price, filings_text=docs or [], source_notes=notes, input_warnings=warnings)
+
+
+def supplement_unindexed(cik: str, facts: dict, as_of: date, notes: list[str], fill: bool | None = None) -> list[str]:
+    """Find periodic filings missing from companyfacts; when filling, add their XBRL facts to `facts` in place.
+
+    Returns Data_Quality warnings and appends provenance notes. Checking needs the SEC submissions API; if it
+    cannot be reached, a warning says so and the review uses companyfacts alone.
+    """
+    fill = sources.FILL_UNINDEXED_FILINGS if fill is None else fill
+    try:
+        found = sources.unindexed_filings(cik, facts, as_of, read=fill)
+    except Exception as exc:
+        return [f"Could not check companyfacts for missing filings (SEC submissions API: {type(exc).__name__}: {exc})."]
+    warnings = []
+    for f, text in zip(found, filings.describe(found)):
+        if f.facts:
+            filings.merge_facts(facts, f.rows)
+            notes.append(f"Input A supplement: companyfacts does not include {text} (from the filing on EDGAR).")
+        elif f.form.endswith("/A") and "no non-dimensional facts" in f.instance:
+            notes.append(f"Input A: companyfacts does not include {text}; an amendment without financial statements, nothing to add.")
+        else:
+            warnings.append(f"Companyfacts does not include {text}; figures for its period are missing.")
+    return warnings
 
 
 def local_inputs(args) -> ReviewInputs:
@@ -5627,6 +5902,7 @@ def chart(ticker: str, ratio: str = "pe", series: str = "eps_ttm"):
     return alt.vconcat(top, bottom)
 
 
+sources.FILL_UNINDEXED_FILINGS = bool(FILL_MISSING_FILINGS)
 INCLUDE_COMPARATIVE_QUARTERS = (REFERENCE_COMPATIBLE if COMPARATIVE_QUARTERS is None else COMPARATIVE_QUARTERS) and True
 REVIEWS, ERRORS, SUMMARY = run_all()
 _display(SUMMARY)
