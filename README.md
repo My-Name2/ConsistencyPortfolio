@@ -19,6 +19,18 @@ data-quality log and red flags from:
 
 Every number comes from these inputs. Facts filed after the as-of date are ignored.
 
+**Filings missing from companyfacts.** SEC's companyfacts API sometimes leaves out a recent 10-Q
+or 10-K although the filing and its XBRL are on EDGAR. As of 2026-09-14 this affected 29 of the
+497 default tickers, for example most utilities' Q2 2026 10-Qs and Citigroup's Q1 and Q2 2026 10-Qs.
+
+When fetching, the review lists the company's periodic filings from the SEC submissions API. It
+reads any filing that companyfacts lacks from that filing's own XBRL instance, using the same
+layout and the same non-dimensional facts (`valuation/filings.py`). Each filing added this way is
+listed under Data_Quality.
+
+Turn this off with `sources.FILL_UNINDEXED_FILINGS = False` (single cell: `FILL_MISSING_FILINGS =
+False`). Data_Quality then warns that the filing's period is missing.
+
 ### No disk use by default
 
 - The GUI keeps fetched inputs in memory. The workbook, report and daily CSV are built in memory
