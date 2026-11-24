@@ -2716,6 +2716,13 @@ COVER_CLASS_RATIO = 0.85  # cover-page shares below this share of weighted basic
 # discontinued). Measured on 486 tickers it fixes some series (BDX, DLTR, HUBB, SLB) but per-period substitution
 # mixes the two definitions for more filers than it repairs, so the default keeps the total.
 PREFER_CONTINUING_OCF = False
+# Opt-in (off by default): also add TTM rows for fiscal quarters that end before the first filing's own period,
+# i.e. quarters that appear only as comparatives in later filings (IPOs, spin-offs, first XBRL years). The value is
+# how many such quarters to add (the latest ones); True or a negative number adds all of them. Each row's valuation
+# date is the first filing that reports a period ending on that quarter, its balance sheet is the one at the quarter
+# end itself (blank when that instant is not reported), and it is marked `comparative`. Such rows never feed the
+# daily table. The written spec starts at the first filing, so the default adds none.
+INCLUDE_COMPARATIVE_QUARTERS: int | bool = 0
 
 
 @dataclass
@@ -2794,14 +2801,15 @@ class BalanceSheet:
         self._logged_partial: set[str] = set()
         self._logged_fallback = False
 
-    def at(self, when: pd.Timestamp) -> dict:
+    def at(self, when: pd.Timestamp, instant: pd.Timestamp | None = None) -> dict:
+        """Balance sheet of the latest filing on or before `when` (or, given `instant`, the values at that instant)."""
         out: dict = {}
         cand = self.anchor[self.anchor["filed"] <= when]
         if cand.empty:
             out["bs_reason"] = "no balance sheet filed on or before this date"
             return out
         last = cand.iloc[-1]
-        instant = last["instant"]
+        instant = last["instant"] if instant is None else instant
         out.update(bs_instant=instant, bs_accn=last["accn"], bs_form=last["form"], bs_filed=last["filed"])
         for key in INSTANT_KEYS:
             row = self.tables[key].get(None, instant)
@@ -3149,10 +3157,15 @@ def _valuation_rows(cf, cal: Calendar, tables, qv, qv_shares, bs: BalanceSheet, 
             dq.add("assumption", "same-day filings", f"{triggers[-1][2]} and {f.accn} were both filed {f.filed.date()}; the later period ({quarter.label}) is the valuation row.", period=f.filed)
             triggers.pop()
         triggers.append((quarter, f.filed, f.accn, f.form, f.regime_taxonomy, f.dominant_currency))
+    comparative = _comparative_triggers(cf, cal, triggers, INCLUDE_COMPARATIVE_QUARTERS)
+    if comparative:
+        dq.add("assumption", "comparative quarters", f"{len(comparative)} TTM row(s) added for quarters before the first filing's period ({comparative[0][0].label} to {comparative[-1][0].label}), reported only as comparatives (opt-in INCLUDE_COMPARATIVE_QUARTERS).")
+    first_real = len(comparative)
+    triggers = comparative + triggers
 
     fy_fallback: list[pd.Timestamp] = []
     fx_rows: list[pd.Timestamp] = []
-    for quarter, filed, accn, form, taxonomy, currency in triggers:
+    for i, (quarter, filed, accn, form, taxonomy, currency) in enumerate(triggers):
         row = {
             "quarter_end": quarter.end,
             "fiscal_quarter": f"Q{quarter.k}",
@@ -3205,8 +3218,10 @@ def _valuation_rows(cf, cal: Calendar, tables, qv, qv_shares, bs: BalanceSheet, 
         missing = [n for n, v in (("operating cash flow", ocf), ("capex", capex)) if not _num(v)]
         row["fcf_reason"] = f"TTM FCF unavailable: {' and '.join(missing)} missing" if missing else ""
 
-        bal = bs.at(filed)
+        bal = bs.at(filed, instant=quarter.end if i < first_real else None)
         row.update(bal)
+        if first_real:
+            row["comparative"] = i < first_real
         if row.get("equity") is None:
             reasons.append("Parent equity: " + ("not tagged at " + str(bal["bs_instant"].date()) if "bs_instant" in bal else bal.get("bs_reason", "")))
 
@@ -3258,6 +3273,30 @@ def _valuation_rows(cf, cal: Calendar, tables, qv, qv_shares, bs: BalanceSheet, 
             "TTM EPS is cross-checked against reported EPS; gaps above 5% are logged under eps_crosscheck.",
         )
     return rows, build
+
+
+def _comparative_triggers(cf, cal: Calendar, triggers: list, depth) -> list:
+    """Triggers for calendar quarters ending before the first filing's own period (opt-in, see INCLUDE_COMPARATIVE_QUARTERS)."""
+    if depth is False or not triggers or (depth is not True and int(depth) == 0):
+        return []
+    first_end = triggers[0][0].end
+    earlier = [q for q in cal.quarters if q.end < first_end - pd.Timedelta(days=3)]
+    if depth is not True and int(depth) > 0:
+        earlier = earlier[-int(depth):]
+    f = cf.facts
+    durations = f[f["start"].notna()]
+    info = cf.filings.drop_duplicates("accn").set_index("accn")
+    out = []
+    for q in earlier:
+        hits = durations[(durations["end"] - q.end).abs() <= pd.Timedelta(days=3)].sort_values(["filed", "accn"])
+        if hits.empty:
+            continue
+        first = hits.iloc[0]
+        meta = info.loc[first["accn"]] if first["accn"] in info.index else None
+        taxonomy = meta["regime_taxonomy"] if meta is not None else triggers[0][4]
+        currency = meta["dominant_currency"] if meta is not None else triggers[0][5]
+        out.append((q, first["filed"], first["accn"], first["form"], taxonomy, currency))
+    return out
 
 
 def _build_row(row: dict, key: str, t) -> dict:
@@ -3620,6 +3659,8 @@ def daily_table(review: Review) -> pd.DataFrame | None:
     prices, ttm = review.prices, review.ttm
     if prices is None or prices.close is None or ttm.empty or review.price_block_reason:
         return None
+    if "comparative" in ttm:
+        ttm = ttm[~ttm["comparative"].fillna(False).astype(bool)]
     rows = ttm.dropna(subset=["valuation_date"]).sort_values("valuation_date").reset_index(drop=True)
     rows = rows.drop_duplicates("valuation_date", keep="last")
     rows["held_row"] = rows.index
@@ -4786,6 +4827,7 @@ Each metric has its own series builder below so metric-specific conventions stay
 """
 
 
+import dataclasses
 import math
 from dataclasses import dataclass
 
@@ -4795,6 +4837,9 @@ import pandas as pd
 METRIC_COLUMNS = {"Rev": "ttm_revenue", "EPS": "eps_ttm", "FCF": "ttm_fcf", "GP": "ttm_gross_profit", "CFO": "ttm_ocf", "EQ": "equity"}
 FIELDS = ["#Obs", "#Inc", "#Rec", "#Inc Adj", "#Rec Adj"]
 MONEY_METRICS = {"Rev", "FCF", "GP", "CFO", "EQ"}  # reference fingerprints are in $ millions (EPS too when it counts net income)
+# Comparative-only quarters (engine flag INCLUDE_COMPARATIVE_QUARTERS) the reference counts, measured on 486 tickers:
+# revenue, gross profit and net income the latest two; CFO and FCF (built from YTD data) all; equity the latest eight.
+COMPARATIVE_DEPTH = {"Rev": 2, "EPS": 2, "GP": 2, "FCF": None, "CFO": None, "EQ": 8}
 ALIGN_COLUMNS = {"ttm_revenue": "Revenue TTM Total", "ttm_ocf": "CFO TTM Total", "ttm_net_income": "Net Income TTM Total"}
 
 
@@ -4806,6 +4851,20 @@ class ReferenceOptions:
     emulate_first_ytd: bool = False  # reference artifact: the first window value of YTD-built series (CFO, FCF) includes the prior YTD
     missing_capex_as_zero: bool = False  # reference fills FCF = CFO where capex is missing
     align_window: bool = False  # end the window at the quarter the reference's latest TTM totals match (drops our newer quarters)
+    # With the engine's opt-in INCLUDE_COMPARATIVE_QUARTERS rows (quarters before the first filing, reported only as
+    # comparatives): keep only the latest N of them (an int, or {metric: N}); None keeps all the engine added.
+    comparative_depth: int | dict | None = None
+    # The reference's window is a date span, not a row count: quarters ending in the as-of month or the `window` x 3
+    # months before it (June 2012 - September 2026 for 57; equity 60 from September 2011). Calendar filers get 57;
+    # filers whose quarters end in Feb/May/Aug/Nov get 56 (May 2012 is before the span and their Aug 2026 quarter was
+    # not reported yet; equity 59). Counted in quarter steps from our latest quarter (a 10-Q missing from Input A still
+    # counts), plus the quarters the reference holds beyond ours when its latest totals match none of our last rows;
+    # the window is that many of our latest rows. See dated_window().
+    window_by_date: bool = False
+    # DIAGNOSTIC ONLY (never in reference_compatible()): alignment by the reference's own fingerprints. Among windows
+    # ending 0, 1 or 2 rows before our latest, take the one whose slope/R2 match the reference on more metrics than
+    # the value-based offset does. It picks the window with the answer it is scored against, so report it separately.
+    align_by_fingerprint: bool = False
     eps_counts_net_income: bool = False  # the reference's "EPS TTM" counts are computed on TTM net income, not per-share EPS
     # Equity (EQ). The reference counts the balance-sheet value at each of the last 60 fiscal quarter ends; its
     # "EQ TTM" fingerprint is the 4-quarter mean of those values over 57 observations (the same 60 quarter ends).
@@ -4820,7 +4879,7 @@ class ReferenceOptions:
     def reference_compatible(cls) -> "ReferenceOptions":
         return cls(window=57, equity_window=60, record_counts_first=True, emulate_first_ytd=True, missing_capex_as_zero=True, align_window=True,
                    eps_counts_net_income=True, eps_net_income="common", equity_quarter_ends=True, equity_total=True, equity_first_reported=True,
-                   equity_fingerprint_mean4=True, equity_history_years=15)
+                   equity_fingerprint_mean4=True, equity_history_years=15, window_by_date=True, comparative_depth=dict(COMPARATIVE_DEPTH))
 
 
 def _num(v) -> bool:
@@ -4873,6 +4932,17 @@ def fingerprint(values: list, window: int, metric: str, money: bool | None = Non
 
 # ---------------------------------------------------------------- alignment
 
+def _totals_hits(ttm: pd.DataFrame, i: int, reference_row: pd.Series) -> int:
+    """On how many of revenue, CFO and net income our row i matches the reference's latest TTM totals (within 0.5%)."""
+    hits = 0
+    for col, ref_col in ALIGN_COLUMNS.items():
+        theirs = pd.to_numeric(str(reference_row.get(ref_col, "")).replace(",", ""), errors="coerce")
+        ours = ttm.at[i, col] if col in ttm else None
+        if _num(theirs) and _num(ours) and theirs != 0 and abs(float(ours) / 1e6 - theirs) <= 0.005 * abs(theirs):
+            hits += 1
+    return hits
+
+
 def alignment_offset(review, reference_row: pd.Series | None) -> int:
     """How many of our latest TTM rows are newer than the reference's latest quarter (0 or more).
 
@@ -4883,23 +4953,23 @@ def alignment_offset(review, reference_row: pd.Series | None) -> int:
     if reference_row is None or review.ttm.empty:
         return 0
     ttm = review.ttm.reset_index(drop=True)
-
-    def matches(i):
-        hits = 0
-        for col, ref_col in ALIGN_COLUMNS.items():
-            theirs = pd.to_numeric(str(reference_row.get(ref_col, "")).replace(",", ""), errors="coerce")
-            ours = ttm.at[i, col] if col in ttm else None
-            if _num(theirs) and _num(ours) and theirs != 0 and abs(float(ours) / 1e6 - theirs) <= 0.005 * abs(theirs):
-                hits += 1
-        return hits
-
     n = len(ttm)
-    if matches(n - 1) >= 2:
+    if _totals_hits(ttm, n - 1, reference_row) >= 2:
         return 0
     for back in (1, 2):
-        if n - 1 - back >= 0 and matches(n - 1 - back) >= 2:
+        if n - 1 - back >= 0 and _totals_hits(ttm, n - 1 - back, reference_row) >= 2:
             return back
     return 0
+
+
+def reference_is_newer(review, reference_row: pd.Series | None) -> bool:
+    """The reference holds a quarter we lack (a 10-Q missing from Input A, or reported after the as-of date): its
+    latest totals match none of our last three rows on two metrics. (Also true where the definitions differ; callers
+    cap what they do with it.)"""
+    if reference_row is None or review.ttm.empty:
+        return False
+    ttm = review.ttm.reset_index(drop=True)
+    return all(_totals_hits(ttm, i, reference_row) < 2 for i in range(max(0, len(ttm) - 3), len(ttm)))
 
 
 # ---------------------------------------------------------------- per-metric series builders
@@ -5057,8 +5127,43 @@ def series_eq(review, ttm: pd.DataFrame, options: ReferenceOptions) -> list:
 SERIES_BUILDERS = {"Rev": series_rev, "EPS": series_eps, "FCF": series_fcf, "GP": series_gp, "CFO": series_cfo, "EQ": series_eq}
 
 
-def series_for(review, metric: str, options: ReferenceOptions, offset: int = 0) -> list:
-    ttm = _ttm(review)
+def _comparative_kept(ttm: pd.DataFrame, depth, metric: str) -> pd.DataFrame:
+    """Drop the earliest comparative-only rows beyond `depth` (they lead the table)."""
+    if isinstance(depth, dict):
+        depth = depth.get(metric)
+    if depth is None or "comparative" not in ttm:
+        return ttm
+    n = int(ttm["comparative"].fillna(False).astype(bool).sum())
+    drop = max(0, n - int(depth))
+    return ttm.iloc[drop:].reset_index(drop=True) if drop else ttm
+
+
+def dated_window(review, metric: str, options: ReferenceOptions, offset: int, window: int, reference_row: pd.Series | None = None) -> int:
+    """How many of our latest rows the reference's date span covers, at most `window`.
+
+    The span holds the quarters ending in the as-of month or the 3 x `window` months before it (from June 2012 for
+    57 quarters as of September 2026, September 2011 for 60). It is counted in quarter steps back from our (aligned)
+    latest quarter end, so a quarter missing from our rows still counts. When the reference is newer, the quarters it
+    holds beyond ours count too: those whose 10-Q was due (45 days) by the as-of date, at least one."""
+    ttm = _comparative_kept(_ttm(review), options.comparative_depth, metric)
+    if len(ttm) <= offset:
+        return 0
+    latest = pd.Timestamp(ttm["quarter_end"].iloc[len(ttm) - 1 - offset])
+    as_of = pd.Timestamp(review.inputs.as_of)
+    first_month = as_of.year * 12 + as_of.month - 3 * window
+    slots = max(0, (latest.year * 12 + latest.month - first_month) // 3 + 1)
+    if offset == 0 and reference_is_newer(review, reference_row):
+        due = sum(1 for j in range(1, 5) if latest + pd.DateOffset(months=3 * j) + pd.Timedelta(days=45) <= as_of)
+        slots += max(1, due)
+    return min(window, slots)
+
+
+def series_for(review, metric: str, options: ReferenceOptions, offset: int = 0, window: int | None = None) -> list:
+    """The metric's TTM series (oldest first), ending `offset` rows before our latest; `window` overrides the
+    options' window for builders that depend on where the window starts (CFO/FCF first-YTD emulation)."""
+    if window is not None and metric != "EQ" and window != options.window:
+        options = dataclasses.replace(options, window=window)
+    ttm = _comparative_kept(_ttm(review), options.comparative_depth, metric)
     if ttm.empty:
         return []
     if offset:
@@ -5066,13 +5171,43 @@ def series_for(review, metric: str, options: ReferenceOptions, offset: int = 0) 
     return SERIES_BUILDERS[metric](review, ttm, options)
 
 
+def fingerprint_matches(counts: dict[str, dict], reference_row: pd.Series | None) -> int:
+    """Metrics whose window fingerprint matches the reference's (slope within 0.5%, R2 within 0.002)."""
+    if reference_row is None:
+        return 0
+    hits = 0
+    for metric, c in counts.items():
+        fp = c["fingerprint"]
+        slope = pd.to_numeric(str(reference_row.get(f"{metric} TTM Slope", "")).replace(",", ""), errors="coerce")
+        r2 = pd.to_numeric(str(reference_row.get(f"{metric} TTM R2", "")).replace(",", ""), errors="coerce")
+        if _num(slope) and _num(r2) and _num(fp["slope"]) and _num(fp["r2"]):
+            hits += abs(fp["slope"] - slope) <= 0.005 * abs(slope) and abs(fp["r2"] - r2) <= 0.002
+    return hits
+
+
 def review_counts(review, options: ReferenceOptions | None = None, reference_row: pd.Series | None = None) -> dict[str, dict]:
     options = options or ReferenceOptions()
     offset = alignment_offset(review, reference_row) if options.align_window else 0
+    out = _counts_at(review, options, offset, reference_row)
+    if options.align_by_fingerprint and reference_row is not None:
+        best = fingerprint_matches(out, reference_row)
+        for other in (0, 1, 2):
+            if other == offset or len(review.ttm) - other < 3:
+                continue
+            alt = _counts_at(review, options, other, reference_row)
+            hits = fingerprint_matches(alt, reference_row)
+            if hits > best:
+                best, out = hits, alt
+    return out
+
+
+def _counts_at(review, options: ReferenceOptions, offset: int, reference_row: pd.Series | None) -> dict[str, dict]:
     out = {}
     for metric in METRIC_COLUMNS:
         window = options.equity_window if metric == "EQ" else options.window
-        values = series_for(review, metric, options, offset)
+        if options.window_by_date:
+            window = dated_window(review, metric, options, offset, window, reference_row)
+        values = series_for(review, metric, options, offset, window=window) if window else []
         counts = window_counts(values, window, options.record_counts_first)
         counts["offset"] = offset
         money = metric in MONEY_METRICS or (metric == "EPS" and options.eps_counts_net_income)
