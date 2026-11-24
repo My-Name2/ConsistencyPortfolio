@@ -39,12 +39,13 @@ class ReferenceOptions:
     equity_first_reported: bool = False  # EQ uses each quarter end's value as first reported, not as later restated
     equity_fingerprint_mean4: bool = False  # compare EQ's fingerprint as the 4-quarter mean over `window` observations
     equity_history_years: int = 0  # with equity_quarter_ends: only quarter ends after the as-of month's start this many years earlier (0 = no limit)
+    eps_net_income: str = "parent"  # with eps_counts_net_income: "parent" (the review's NI attributable to parent) or "common" (NI available to common stockholders)
 
     @classmethod
     def reference_compatible(cls) -> "ReferenceOptions":
         return cls(window=57, equity_window=60, record_counts_first=True, emulate_first_ytd=True, missing_capex_as_zero=True, align_window=True,
-                   eps_counts_net_income=True, equity_quarter_ends=True, equity_total=True, equity_first_reported=True, equity_fingerprint_mean4=True,
-                   equity_history_years=15)
+                   eps_counts_net_income=True, eps_net_income="common", equity_quarter_ends=True, equity_total=True, equity_first_reported=True,
+                   equity_fingerprint_mean4=True, equity_history_years=15)
 
 
 def _num(v) -> bool:
@@ -184,11 +185,46 @@ def series_fcf(review, ttm: pd.DataFrame, options: ReferenceOptions) -> list:
     return values
 
 
+# Net income available to common stockholders (after preferred dividends and participating-security
+# allocations), falling back per period to NI attributable to parent, then ProfitLoss less NCI income.
+NI_COMMON_CANDIDATES = {
+    "us-gaap": ("NetIncomeLossAvailableToCommonStockholdersBasic", "NetIncomeLoss", "ProfitLoss"),
+    "ifrs-full": ("ProfitLossAttributableToOwnersOfParent", "ProfitLoss"),
+}
+
+
+def _ttm_from_tags(review, ttm: pd.DataFrame, key: str, candidates: dict) -> list:
+    """TTM sums of a flow built from `candidates` (taxonomy -> tags in priority order), one per TTM row,
+    with the review's own period rules (YTD differencing, FY - 9M, NCI subtracted from ProfitLoss)."""
+    from .dq import DQLog
+    from .periods import quarterly_values, ttm_flow
+    from .tags import MetricDef
+    from .values import build_metric_table, parent_share_of_profit_loss
+
+    table = build_metric_table(review.cf, MetricDef(key, key, "duration", "money", True, dict(candidates)), review.basis, DQLog())
+    if table.table.empty:
+        return [None] * len(ttm)
+    table = parent_share_of_profit_loss(table, review.tables["nci_income"], DQLog())
+    cal = review.calendar
+    qv = quarterly_values(table, cal, DQLog())
+    by_end = {q.end: q for q in cal.quarters}
+    out = []
+    for end in ttm["quarter_end"]:
+        q = by_end.get(pd.Timestamp(end))
+        out.append(None if q is None else ttm_flow(table, qv, cal, q).value)
+    return out
+
+
 def series_eps(review, ttm: pd.DataFrame, options: ReferenceOptions) -> list:
     # The reference's "EPS TTM" fingerprint (slope, R2, CV%) equals TTM net income's in $ millions
     # (AAPL 1520.44 / 0.8742 / 38.86%, MSFT 1872.63 / 0.8564 / 68.94%), so its counts use net income.
-    column = "ttm_net_income" if options.eps_counts_net_income else "eps_ttm"
-    return list(pd.to_numeric(ttm[column], errors="coerce"))
+    if not options.eps_counts_net_income:
+        return list(pd.to_numeric(ttm["eps_ttm"], errors="coerce"))
+    if options.eps_net_income == "common":
+        # Its net income is after preferred dividends: JPM 778.82 / 0.8662 (ours with NI to parent 780.43 / 0.8705);
+        # latest "Net Income TTM Total" 63,634 = NI available to common (NI attributable to parent 65,067).
+        return _ttm_from_tags(review, ttm, "net_income_common", NI_COMMON_CANDIDATES)
+    return list(pd.to_numeric(ttm["ttm_net_income"], errors="coerce"))
 
 
 def quarter_end_equity(review, last_quarter_end, total: bool = False, first_reported: bool = False, since=None) -> list:

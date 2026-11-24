@@ -493,6 +493,24 @@ def test_reference_equity_quarter_ends_total_and_first_reported():
     limited = review_counts(r, ReferenceOptions(window=57, equity_window=60, equity_quarter_ends=True, equity_history_years=2))
     assert limited["EQ"]["#Obs"] == 8
 
+def test_reference_eps_counts_net_income_available_to_common():
+    from valuation.reference import ReferenceOptions, series_for
+
+    common = "NetIncomeLossAvailableToCommonStockholdersBasic"
+
+    def mutate(f):
+        items = [dict(i, val=i["val"] - 1_000.0 * (4 if (pd.Timestamp(i["end"]) - pd.Timestamp(i["start"])).days > 300 else 1))
+                 for i in f["us-gaap"]["NetIncomeLoss"]["units"]["USD"] if (pd.Timestamp(i["end"]) - pd.Timestamp(i["start"])).days < 100 or (pd.Timestamp(i["end"]) - pd.Timestamp(i["start"])).days > 300]
+        f["us-gaap"][common] = {"label": common, "units": {"USD": items}}
+
+    r = _review_with(mutate)
+    parent = series_for(r, "EPS", ReferenceOptions(eps_counts_net_income=True))
+    to_common = series_for(r, "EPS", ReferenceOptions(eps_counts_net_income=True, eps_net_income="common"))
+    assert pd.Series(parent, dtype=float).equals(pd.to_numeric(r.ttm["ttm_net_income"], errors="coerce").reset_index(drop=True).astype(float))  # NI to parent by default
+    pairs = [(a, b) for a, b in zip(parent, to_common) if pd.notna(a) and b is not None]
+    assert pairs and all(b == pytest.approx(a - 4_000.0) for a, b in pairs)  # four quarters of 1,000 preferred dividends
+    assert ReferenceOptions.reference_compatible().eps_net_income == "common"
+
 
 def test_single_cell_is_in_sync_with_the_package():
     import importlib.util
